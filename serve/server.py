@@ -499,6 +499,27 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[maya] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+def start_log_tail(log, offset, n=20):
+    """The last n lines this start wrote to the engine log, for the error when the engine ended before READY -
+    whatever the failure (a VRAM shortage, a missing file), the engine's own reason is in them; the traceback
+    alone says nothing.  "" when there is no log or nothing in it from this start."""
+    if not log:
+        return ""
+    try:
+        with open(log, "rb") as f:
+            f.seek(0, 2)
+            start = max(offset, f.tell() - 64 * 1024)   # enough for 20 lines, never an earlier start's
+            f.seek(start)
+            text = f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        return ""
+    lines = text.splitlines()[1 if start > offset else 0:]   # not a line cut in half
+    lines = [x.rstrip() for x in lines if x.strip()][-n:]
+    if not lines:
+        return ""
+    return "\nthe engine log's last lines:\n" + "\n".join("  " + x for x in lines)
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -517,6 +538,7 @@ class StrataEngine:
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
+        self.log_offset = os.path.getsize(log) if log else 0   # this start's lines in the log (the tail on a failed start)
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0
@@ -562,7 +584,8 @@ class StrataEngine:
                 break
         loading.set()
         if self.max_context <= 0:
-            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
+            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "")
+                               + start_log_tail(log, getattr(self, "log_offset", 0)))
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
         # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
         if self.info.get("engine"):

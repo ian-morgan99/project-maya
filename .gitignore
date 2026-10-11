@@ -53,3 +53,7 @@ build-vision.bat
 *.done
 /third_party/*.zip
 
+
+# local machine state (the installer writes the config; disabled alternates live in configs-disabled/)
+/maya-*.json
+configs-disabled/

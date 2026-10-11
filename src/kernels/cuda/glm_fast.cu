@@ -764,7 +764,11 @@ __device__ __forceinline__ XV load_xv(const block_q8_1* xb) {
     v.s = ds.y;
     return v;
 }
-template<int T> __device__ __forceinline__ float dw(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab);
+// the primary template is a definition (returns 0) rather than a bare declaration: CUDA 13's frontend emits
+// references to the K-quant instantiations (dw<10>, dw<11>) even though rows_dot's if constexpr never reaches
+// them, and NVVM aborts on the undefined externals ("Global is external, but doesn't have external or weak
+// linkage!").  Those paths are unreachable at runtime; a real dispatch bug shows up as zeros, not a link error.
+template<int T> __device__ __forceinline__ float dw(const uint8_t*, int, int, const XV&, const uint32_t*) { return 0.0f; }
 template<> __device__ __forceinline__ float dw<19>(const uint8_t* row, int kbx, int iqs, const XV& x, const uint32_t* tab) {
     const block_iq1_s* bq1 = (const block_iq1_s*) row + kbx;
     const int qs_packed = get_int_b2(bq1->qs, iqs);
