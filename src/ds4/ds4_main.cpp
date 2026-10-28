@@ -53,6 +53,9 @@
 #else
 #include <unistd.h>
 #include <cerrno>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#endif
 #endif
 
 namespace {
@@ -983,6 +986,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::signal(SIGTERM, SIG_IGN);
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
+#else
+        // (Windows sends a console's Ctrl+C and Ctrl+Break to every process on it, the engine too; the server stops
+        // on them and ends the engine with QUIT)
+        std::signal(SIGINT, SIG_IGN);
+        std::signal(SIGBREAK, SIG_IGN);
 #endif
     }
     // STAT for the Monitor over a decode so far (from t1, the counters s_dec and the storage's io_dec then): the GLM
@@ -1334,6 +1342,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 finish = "cancel";
                 break;
             }
+            if (tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
+                std::fprintf(stderr, "ds4: the sample failed\n");
+                finish = "cancel";
+                break;
+            }
             std::printf("T %d\n", tok);
             beat();
             ++produced;
@@ -1423,7 +1436,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     // request's prompt - its pictures too: the tower borrows its room and gives it back before the prompt, with every
     // other request between two of its tokens - is read while the others wait; then each running request writes a
     // token a step.  A request alone decodes in its rounds as with one conversation (DSpark's drafts, the prompt
-    // lookup); two or more go through Model::step_multi - a token of each through the model together, no drafts.
+    // lookup); two or more in rounds together - each one's DSpark drafts (its share of a window), every one's token
+    // and drafts through the model at once (Model::step_multi_spec, verify_multi), or with no drafts a token of each
+    // (Model::step_multi).  With several running, each writes all of its round's tokens at once, so every one needs
+    // the model in the same step again.
     if (multi) {
         struct Act {
             Req r;
@@ -1479,10 +1495,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::fflush(stdout);
             std::fprintf(stderr,
                          "maya ds4 serve: request %lld: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), "
-                         "%lld generated in %.0f ms (%.2f tok/s, %zu conversations running)\n",
+                         "%lld generated in %.0f ms (%.2f tok/s, %zu conversations running; drafts %lld of %lld kept)\n",
                          a.r.rid, a.r.ids.size(), a.P.from, a.r.ids.size() - a.P.from, a.t1 - a.P.t0,
                          a.t1 > a.P.t0 ? 1000.0 * (double) (a.r.ids.size() - a.P.from) / (a.t1 - a.P.t0) : 0.0,
-                         a.produced, t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0, acts.size());
+                         a.produced, t2 - a.t1, t2 > a.t1 ? 1000.0 * (double) a.produced / (t2 - a.t1) : 0.0, acts.size(),
+                         a.d_acc, a.d_off);
             seq_rid[(size_t) a.seq] = -1;
             seq_used[(size_t) a.seq] = ++use_clock;
             in.forget(a.r.rid);
@@ -1586,39 +1603,52 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 beat();
             }
             if (quit) in.stop_all.store(true);
-            // each running request writes its next token; those whose next one the model must make go below
+            // each running request writes its next token; those whose next one the model must make go below (with
+            // several running, a round's tokens all at once: every one then needs the model in the same step, so
+            // their rounds go through it together)
             std::vector<Act*> need;
             const long long n0 = busy_n;
+            const bool several = acts.size() > 1;
             for (auto& ap : acts) {
                 Act& a = *ap;
-                if (in.stopped(a.r.rid)) {
-                    a.finish = "cancel";
-                    a.done = true;
-                    continue;
+                for (;;) {
+                    if (in.stopped(a.r.rid)) {
+                        a.finish = "cancel";
+                        a.done = true;
+                        break;
+                    }
+                    if (a.tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client)
+                        std::fprintf(stderr, "ds4: the sample failed\n");
+                        a.finish = "cancel";
+                        a.done = true;
+                        break;
+                    }
+                    std::printf("T %lld %d\n", a.r.rid, a.tok);
+                    beat();
+                    ++a.produced;
+                    ++busy_n;
+                    if (lk && lk_owner == a.r.rid) lk->sfx.append(a.tok);
+                    if (a.in_think && a.tok == a.r.think_end) a.in_think = false;
+                    bool eos_tok = false;
+                    for (int e : eos) eos_tok = eos_tok || a.tok == e;
+                    if (eos_tok) {
+                        a.finish = "stop";
+                        a.done = true;
+                        break;
+                    }
+                    if (a.produced >= a.limit || m.seq_pos(a.seq) >= m.max_context()) {
+                        a.done = true;
+                        break;
+                    }
+                    if (!a.got.empty()) {
+                        a.tok = a.got.back();
+                        a.got.pop_back();
+                        if (several) continue;
+                        break;
+                    }
+                    need.push_back(&a);
+                    break;
                 }
-                std::printf("T %lld %d\n", a.r.rid, a.tok);
-                beat();
-                ++a.produced;
-                ++busy_n;
-                if (lk && lk_owner == a.r.rid) lk->sfx.append(a.tok);
-                if (a.in_think && a.tok == a.r.think_end) a.in_think = false;
-                bool eos_tok = false;
-                for (int e : eos) eos_tok = eos_tok || a.tok == e;
-                if (eos_tok) {
-                    a.finish = "stop";
-                    a.done = true;
-                    continue;
-                }
-                if (a.produced >= a.limit || m.seq_pos(a.seq) >= m.max_context()) {
-                    a.done = true;
-                    continue;
-                }
-                if (!a.got.empty()) {
-                    a.tok = a.got.back();
-                    a.got.pop_back();
-                    continue;
-                }
-                need.push_back(&a);
             }
             if (busy_n / 8 != n0 / 8) {   // the Monitor's line, every 8 tokens of all of them
                 std::string st = stat_text(busy_t1, busy_s, busy_io, busy_n, 0, 0);
@@ -1626,14 +1656,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::printf("%s\n", st.c_str());
             }
             std::fflush(stdout);
-            if (need.size() == 1 && acts.size() == 1) {   // alone: its rounds, as with one conversation
+            if (need.size() == 1) {   // alone (or the last of several still running): its rounds, as with one conversation
                 Act& a = *need[0];
                 bind(a.seq);
                 int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.pos());
                 const bool closing = close_think(a);
                 if (closing) room = 1;
                 else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
-                Lookup* L = a.r.lookup == 0 ? nullptr : lk;
+                // (the prompt lookup alone only: its history follows one request)
+                Lookup* L = a.r.lookup == 0 || acts.size() > 1 ? nullptr : lk;
                 if (L != nullptr && lk_owner != a.r.rid) {   // (its history: what it consumed, then the token written)
                     L->start(m.tokens());
                     L->sfx.append(a.tok);
@@ -1656,40 +1687,124 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     a.tok = a.got.back();
                     a.got.pop_back();
                 }
-            } else if (need.size() == 1) {   // one of several: a plain step of its conversation
-                Act& a = *need[0];
-                bind(a.seq);
-                if (!m.step(a.tok, true, err)) {
-                    std::fprintf(stderr, "ds4: %s\n", err.c_str());
-                    a.finish = "cancel";
-                    a.done = true;
-                } else {
-                    penalties(a.r);
-                    const bool closing = close_think(a);
-                    a.tok = m.sample(a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed, a.counter++);
-                    if (closing) a.tok = a.r.think_end;
-                }
-            } else if (need.size() > 1) {   // several: a token of each through the model together
-                std::vector<int> sv, tv;
-                for (Act* a : need) {
-                    sv.push_back(a->seq);
-                    tv.push_back(a->tok);
-                }
-                if (!m.step_multi(sv.data(), tv.data(), (int) sv.size(), err)) {
+            } else if (need.size() > 1) {   // several: a round of each through the model together
+                // each one's drafts (DSpark, a conversation at a time: its own drafter rings) while their confidence
+                // holds, its share of a window at most; then every one's token and drafts through the model at once
+                // (step_multi_spec) and each its verdict (verify_multi).  No drafts this round: a token of each
+                const int nn = (int) need.size(), share = m.verify_max() / nn;
+                const auto cancel_all = [&] {
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     for (Act* a : need) {
                         a->finish = "cancel";
                         a->done = true;
                     }
-                } else
-                    for (size_t i = 0; i < need.size(); ++i) {
-                        Act& a = *need[i];
-                        penalties(a.r);
-                        const bool closing = close_think(a);
-                        a.tok = m.sample_multi((int) i, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
-                                               a.counter++);
-                        if (closing) a.tok = a.r.think_end;
+                };
+                std::vector<std::vector<int>> drafts((size_t) nn);
+                std::vector<std::vector<float>> confs((size_t) nn);
+                std::vector<char> tried((size_t) nn, 0), closing((size_t) nn, 0);
+                std::vector<int> rooms((size_t) nn, 1), dsv, dys, dix;   // (the ones that draft: conversation, y, index)
+                bool any = false, failed = false;
+                for (int i = 0; i < nn; ++i) {
+                    Act& a = *need[(size_t) i];
+                    int room = (int) std::min<long long>(a.limit - a.produced, m.max_context() - m.seq_pos(a.seq));
+                    closing[(size_t) i] = close_think(a);
+                    if (closing[(size_t) i]) room = 1;
+                    else if (a.in_think) room = (int) std::min<long long>(room, a.r.think_budget - a.produced);
+                    rooms[(size_t) i] = room = std::min(room, share);
+                    if (!((a.r.spec < 0 ? spec : a.r.spec != 0) && !a.cool && room > 1 && m.draft_block() > 0)) continue;
+                    tried[(size_t) i] = 1;
+                    dsv.push_back(a.seq);
+                    dys.push_back(a.tok);
+                    dix.push_back(i);
+                }
+                // their drafts: in one drafter pass where they fit one (Model::draft_multi), else one after another
+                // (the drafter's argmax either way: verify_multi takes each draft as a point)
+                const int nd = (int) dsv.size();
+                const bool one_pass = nd > 1 && m.can_draft_multi(dsv.data(), nd);
+                if (nd > 1 && !one_pass) {   // (more drafters than one pass holds - four with DSpark's block: a drafter
+                                             //  pass each cost more than their drafts won, so a token of each)
+                    for (int j : dix) tried[(size_t) j] = 0;
+                } else if (one_pass) {
+                    std::vector<std::vector<int>> dd;
+                    std::vector<std::vector<float>> cc;
+                    failed = !m.draft_multi(dsv.data(), dys.data(), nd, dd, cc, err);
+                    for (int j = 0; j < nd && !failed; ++j) {
+                        drafts[(size_t) dix[(size_t) j]] = std::move(dd[(size_t) j]);
+                        confs[(size_t) dix[(size_t) j]] = std::move(cc[(size_t) j]);
                     }
+                } else
+                    for (int j = 0; j < nd && !failed; ++j) {
+                        bind(dsv[(size_t) j]);
+                        failed = !m.draft(dys[(size_t) j], drafts[(size_t) dix[(size_t) j]], confs[(size_t) dix[(size_t) j]], err);
+                    }
+                for (int i = 0; i < nn && !failed; ++i) {
+                    if (!tried[(size_t) i]) continue;
+                    Act& a = *need[(size_t) i];
+                    const int room = rooms[(size_t) i];
+                    std::vector<int>& d = drafts[(size_t) i];
+                    const std::vector<float>& conf = confs[(size_t) i];
+                    const float cmin = a.r.conf >= 0 ? a.r.conf : conf_min;
+                    const float cum_min = a.r.cum >= 0 ? a.r.cum : dspark_cum_default();
+                    int keep = 0;
+                    float cum = 1.0f;
+                    while (keep < (int) d.size() && keep < room - 1 && conf[(size_t) keep] >= cmin &&
+                           (cum *= conf[(size_t) keep]) >= cum_min)
+                        ++keep;
+                    d.resize((size_t) keep);
+                    any = any || keep > 0;
+                }
+                if (failed) cancel_all();
+                else if (!any) {
+                    std::vector<int> sv, tv;
+                    for (Act* a : need) {
+                        sv.push_back(a->seq);
+                        tv.push_back(a->tok);
+                    }
+                    if (!m.step_multi(sv.data(), tv.data(), nn, err)) cancel_all();
+                    else
+                        for (int i = 0; i < nn; ++i) {
+                            Act& a = *need[(size_t) i];
+                            penalties(a.r);
+                            a.tok = m.sample_multi(i, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
+                                                   a.counter++);
+                            if (closing[(size_t) i]) a.tok = a.r.think_end;
+                            a.cool = tried[(size_t) i] != 0;   // (its drafter tried and kept none: rests a round)
+                        }
+                } else {
+                    std::vector<std::vector<int>> rows((size_t) nn);
+                    std::vector<const int*> tp((size_t) nn);
+                    std::vector<int> sv((size_t) nn), lens((size_t) nn);
+                    for (int i = 0; i < nn; ++i) {
+                        rows[(size_t) i].push_back(need[(size_t) i]->tok);
+                        rows[(size_t) i].insert(rows[(size_t) i].end(), drafts[(size_t) i].begin(), drafts[(size_t) i].end());
+                        tp[(size_t) i] = rows[(size_t) i].data();
+                        lens[(size_t) i] = (int) rows[(size_t) i].size();
+                        sv[(size_t) i] = need[(size_t) i]->seq;
+                    }
+                    if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), nn, err)) cancel_all();
+                    else
+                        for (int i = 0; i < nn; ++i) {
+                            Act& a = *need[(size_t) i];
+                            const std::vector<int>& d = drafts[(size_t) i];
+                            penalties(a.r);
+                            int acc = 0, next = -1;
+                            if (!m.verify_multi(i, d, a.r.temperature, a.r.top_p, a.r.top_k, a.r.min_p, a.r.seed,
+                                                a.counter, acc, next, err)) {
+                                cancel_all();
+                                break;
+                            }
+                            a.counter += (unsigned long long) acc + 1;
+                            a.d_off += (long long) d.size();
+                            a.d_acc += acc;
+                            a.cool = tried[(size_t) i] && d.empty();
+                            a.got.assign(d.begin(), d.begin() + acc);
+                            a.got.push_back(next);
+                            if (closing[(size_t) i]) a.got.back() = a.r.think_end;
+                            std::reverse(a.got.begin(), a.got.end());
+                            a.tok = a.got.back();
+                            a.got.pop_back();
+                        }
+                }
             }
             for (size_t i = 0; i < acts.size();) {
                 if (!acts[i]->done) {
@@ -1827,13 +1942,165 @@ int check_multi(strata::ds4::Model& m, const std::vector<int>& ids, int n) {
                 N, n, same_rows, rows, max_d, tokens_same ? "yes" : "NO",
                 ms_alone > 0 ? 1000.0 * steps * N / ms_alone : 0.0, ms_together > 0 ? 1000.0 * steps * N / ms_together : 0.0,
                 ms_together > 0 ? ms_alone / ms_together : 0.0);
-    return tokens_same && same_rows == rows ? 0 : 1;
+    // ... then with the drafter, greedy, so the tokens alone are due again - every draft verified, whatever its
+    // confidence, so rejected windows are undone often: each conversation alone (draft / verify, one conversation's
+    // rounds), then together (step_multi_spec / verify_multi, as the server's rounds, each conversation's drafts its
+    // share of a window) with the drafts made one conversation after another, then in one drafter pass (draft_multi)
+    bool spec_same = true;
+    double ms_spec_alone = 0;
+    for (int pass = 0; pass < 3 && m.draft_block() > 0; ++pass) {
+        std::vector<std::vector<int>> spec_t((size_t) N);
+        long long offered = 0, kept = 0, rounds = 0, one_pass = 0;
+        double ms_spec = 0;
+        for (int i = 0; i < N; ++i) {
+            if (!prompt(i)) {
+                std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                return 1;
+            }
+            spec_t[(size_t) i].push_back(m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0));
+        }
+        if (pass == 0)
+            for (int i = 0; i < N; ++i) {
+                std::vector<int>& got = spec_t[(size_t) i];
+                m.seq_bind(i);
+                const double t0 = now_ms();
+                while ((int) got.size() < n) {
+                    const int room = std::min(m.verify_max(), n - (int) got.size());
+                    std::vector<int> drafts;
+                    std::vector<float> conf;
+                    int acc = 0, next = -1;
+                    if (room > 1 && !m.draft(got.back(), drafts, conf, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    if ((int) drafts.size() > room - 1) drafts.resize((size_t) std::max(0, room - 1));
+                    if (drafts.empty()) {
+                        if (!m.step(got.back(), true, err)) {
+                            std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                            return 1;
+                        }
+                        next = m.sample(0.0f, 1.0f, 0, 0.0f, 0, 0);
+                    } else if (!m.verify(got.back(), drafts, 0.0f, 1.0f, 0, 0.0f, 0, 0, acc, next, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    got.insert(got.end(), drafts.begin(), drafts.begin() + acc);
+                    got.push_back(next);
+                    offered += (long long) drafts.size();
+                    kept += acc;
+                    ++rounds;
+                }
+                ms_spec += now_ms() - t0;
+            }
+        else {
+            const int share = m.verify_max() / N;
+            const double t0 = now_ms();
+            for (;;) {
+                std::vector<int> sv;
+                for (int i = 0; i < N; ++i)
+                    if ((int) spec_t[(size_t) i].size() < n) sv.push_back(i);
+                if (sv.empty()) break;
+                const int k = (int) sv.size();
+                std::vector<std::vector<int>> rws((size_t) k), drafts((size_t) k);
+                std::vector<const int*> tp((size_t) k);
+                std::vector<int> lens((size_t) k), dsv, dys, dix;
+                for (int j = 0; j < k; ++j) {
+                    const std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    if (std::min(share, n - (int) got.size()) > 1) {
+                        dsv.push_back(sv[(size_t) j]);
+                        dys.push_back(got.back());
+                        dix.push_back(j);
+                    }
+                }
+                const int nd = (int) dsv.size();
+                if (pass == 2 && nd > 1 && m.can_draft_multi(dsv.data(), nd)) {
+                    std::vector<std::vector<int>> dd;
+                    std::vector<std::vector<float>> cc;
+                    if (!m.draft_multi(dsv.data(), dys.data(), nd, dd, cc, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (int j = 0; j < nd; ++j) drafts[(size_t) dix[(size_t) j]] = dd[(size_t) j];
+                    ++one_pass;
+                } else
+                    for (int j = 0; j < nd; ++j) {
+                        std::vector<float> conf;
+                        m.seq_bind(dsv[(size_t) j]);
+                        if (!m.draft(dys[(size_t) j], drafts[(size_t) dix[(size_t) j]], conf, err)) {
+                            std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                            return 1;
+                        }
+                    }
+                for (int j = 0; j < k; ++j) {
+                    const std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    const int room = std::min(share, n - (int) got.size());
+                    if ((int) drafts[(size_t) j].size() > room - 1) drafts[(size_t) j].resize((size_t) std::max(0, room - 1));
+                    rws[(size_t) j].push_back(got.back());
+                    rws[(size_t) j].insert(rws[(size_t) j].end(), drafts[(size_t) j].begin(), drafts[(size_t) j].end());
+                    tp[(size_t) j] = rws[(size_t) j].data();
+                    lens[(size_t) j] = (int) rws[(size_t) j].size();
+                }
+                if (!m.step_multi_spec(sv.data(), tp.data(), lens.data(), k, err)) {
+                    std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                    return 1;
+                }
+                for (int j = 0; j < k; ++j) {
+                    int acc = 0, next = -1;
+                    if (!m.verify_multi(j, drafts[(size_t) j], 0.0f, 1.0f, 0, 0.0f, 0, 0, acc, next, err)) {
+                        std::fprintf(stderr, "multi check: %s\n", err.c_str());
+                        return 1;
+                    }
+                    std::vector<int>& got = spec_t[(size_t) sv[(size_t) j]];
+                    got.insert(got.end(), drafts[(size_t) j].begin(), drafts[(size_t) j].begin() + acc);
+                    got.push_back(next);
+                    offered += (long long) drafts[(size_t) j].size();
+                    kept += acc;
+                }
+                ++rounds;
+            }
+            ms_spec = now_ms() - t0;
+        }
+        if (pass == 0) ms_spec_alone = ms_spec;
+        bool same_all = true;
+        for (int i = 0; i < N; ++i) {
+            size_t d = 0;
+            while (d < alone[(size_t) i].size() && alone[(size_t) i][d] == spec_t[(size_t) i][d]) ++d;
+            const bool same = d == alone[(size_t) i].size();
+            same_all = same_all && same;
+            if (!same) std::printf("multi check: conversation %d with the drafter (pass %d): differs from token %zu on\n", i, pass, d);
+        }
+        spec_same = spec_same && same_all;
+        static const char* const what[3] = {"alone with the drafter", "together, drafts one after another",
+                                            "together, drafts in one pass"};
+        std::printf("multi check: %d conversations x %d tokens %s: tokens the same: %s; %lld rounds%s, drafts %lld of "
+                    "%lld kept; %.2f tok/s in all (x%.2f over together without, x%.2f over alone with the drafter)\n",
+                    N, n, what[pass], same_all ? "yes" : "NO", rounds,
+                    pass == 2 ? (" (" + std::to_string(one_pass) + " drafted in one pass)").c_str() : "", kept, offered,
+                    ms_spec > 0 ? 1000.0 * steps * N / ms_spec : 0.0, ms_spec > 0 ? ms_together / ms_spec : 0.0,
+                    ms_spec > 0 ? ms_spec_alone / ms_spec : 0.0);
+    }
+    return tokens_same && spec_same && same_rows == rows ? 0 : 1;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     strata::platform::env_aliases();   // (MAYA_* settings under their older names too)
+#if defined(__linux__)
+    // the kernel's NUMA balancing (kernel.numa_balancing=1) scans memory whose policy migrates on fault: every thread
+    // then takes hinting faults - the launch thread hundreds a second, the CPU lane's workers on their shared scratch,
+    // each phase as slow as its straggler (a 2-socket Xeon: 3k faults/s decoding).  MPOL_LOCAL as the task policy,
+    // before any thread (they inherit it), allocates as the default does but takes the process out of the scan.
+    // DS4_NUMA_BALANCE=1: left to the kernel.  (A container needs SYS_NICE for set_mempolicy / mbind.)
+    // A policy the user set (numactl --interleave / --membind around the engine) is left as it is: only the default one
+    // is replaced.
+    int pol_mode = 0;
+    const bool pol_default = syscall(SYS_get_mempolicy, &pol_mode, nullptr, 0, nullptr, 0) != 0 || pol_mode == 0;
+    if (const char* nb = std::getenv("DS4_NUMA_BALANCE"); pol_default && (nb == nullptr || std::atoi(nb) == 0))
+        if (syscall(SYS_set_mempolicy, 4 /* MPOL_LOCAL */, nullptr, 0) != 0)
+            std::fprintf(stderr, "ds4: set_mempolicy(MPOL_LOCAL) failed (%s): NUMA balancing still scans the engine\n",
+                         std::strerror(errno));
+#endif
     // cuBLAS gives the same bits run after run only with one stream active or with its workspace pinned (its notes on
     // reproducibility): the chunked prompt path's GEMMs run beside the copy and hc streams, and without this each
     // process could pick other kernels - a long prompt's logits differing from one start to the next.  Before any
@@ -1859,6 +2126,7 @@ int main(int argc, char** argv) {
     std::string ids_s, dump, eos = "1", ppl;
     int n = 0, window = 16, suffix_draft = 3;
     bool spec = true;
+    bool dspark_on_asked = false;   // (--dspark on given: a pack without drafter blocks is then told)
     float temp = 0.0f;   // the CLI's sampling (0: greedy)
     unsigned long long cli_seed = 1;
     bool serve_mode = false, multi_check = false;
@@ -1900,6 +2168,7 @@ int main(int argc, char** argv) {
             const std::string v = val("--dspark");
             spec = v != "off";
             o.dspark = v != "none";   // none: not even loaded
+            dspark_on_asked = v == "on";
         } else if (a == "--dspark-conf") o.dspark_conf = (float) std::atof(val("--dspark-conf").c_str());
         else if (a == "--suffix-draft") suffix_draft = std::max(0, std::atoi(val("--suffix-draft").c_str()));
         else if (a == "--tp") o.tp = std::max(1, std::atoi(val("--tp").c_str()));
@@ -1960,6 +2229,9 @@ int main(int argc, char** argv) {
         return 1;
     }
     if (!o.vision_only) std::fprintf(stderr, "%s", m.describe().c_str());
+    if (dspark_on_asked && !o.vision_only && !m.has_drafter())
+        std::fprintf(stderr, "maya-ds4: warning: --dspark on, but this pack has no DSpark drafter blocks (mtp.* tensors): "
+                             "decoding with prompt lookup only (no drafter)\n");
     std::unique_ptr<Lookup> lk;   // (prompt lookup beside DSpark, or alone: one policy over every request of this run)
     if (suffix_draft > 0)
         lk = std::make_unique<Lookup>(suffix_draft, m.verify_max(), (size_t) m.max_context() + 4096);
@@ -2120,6 +2392,10 @@ int main(int argc, char** argv) {
         if (lk) lk->start(m.tokens());
         const long long lk_w0 = lk ? lk->windows : 0, lk_o0 = lk ? lk->offered : 0, lk_a0 = lk ? lk->accepted : 0;
         for (;;) {
+            if (tok < 0) {   // (a sample's CUDA error, printed by the sampler)
+                std::fprintf(stderr, "maya-ds4: the sample failed\n");
+                return 1;
+            }
             out.push_back(tok);
             std::printf("%d,", tok);
             std::fflush(stdout);
