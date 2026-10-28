@@ -25,6 +25,13 @@ struct Options {
     std::vector<int> layer_split; // the first layer of each GPU's share after the first (empty: by their free memory)
     int max_ctx = 32768;
     int chunk = 1024;             // prompt tokens a forward takes at most
+    bool chunk_given = false;     // (--chunk: chosen - the prefill calibration's chunk is not taken)
+    // the prompt path's dense GEMMs (mm3_gguf.cuh's set_gemm): -1 the prefill calibration's for this PC (else the
+    // BLAS), 0 the BLAS, 1 hipBLASLt (AMD); and the calibration's cache (prefill_tune: its file - empty: the pack's
+    // prefill-tune.txt; tune: read it at all)
+    int prefill_gemm = -1;
+    std::string prefill_tune;
+    bool tune = true;
     int staging = 48;             // expert staging slots a GPU (each one expert's blob)
     double reserve_gb = -1;       // VRAM a GPU keeps free beyond the plan (< 0: 1.0, the tensor-parallel path 0.3 -
                                   // it allocates all it needs at the load)
@@ -33,7 +40,8 @@ struct Options {
     bool pin_pool = true;         // the experts not in VRAM assembled once in pinned host memory (a miss: one DMA)
     bool fast_decode = true;      // one token: the decode GEMVs and the token's fused experts (else the prompt path)
     int cpu_threads = -2;         // the CPU lane's workers besides the caller (-1: no CPU lane, misses are staged;
-                                  // -2: this host's, CpuLane::auto_workers - one a physical core, the first the caller's)
+                                  // -2: this host's, CpuLane::auto_workers - one a physical core, the first the caller's,
+                                  // 2 cores left free where there are no SMT siblings); --cpu-threads N: N - 1 of them
     bool dspark = false;          // load the DSpark draft (the pack's dspark/) on the head's GPU
     bool vision = true;           // load the vision tower (the pack's vision.*) on gpus[vision_gpu], before the experts
     bool vision_auto = true;      // (vision not asked for by name: a pack without a tower runs text only, no error)
@@ -56,6 +64,9 @@ struct Options {
     // they are rounded (--kv-rot); the index keys stay BF16 (the blocks each query keeps do not move)
     int kv_k = 1, kv_v = 1;   // (INT8, rows rotated: tools/mm3/kv_gate.py decides whether FP4 joins it)
     bool kv_rot = true;
+    // --parallel: conversations at once - a KV cache (and index-key cache) each, the context's room for every one of
+    // them (more than 1: no KV streaming, no DSpark draft, the layer split)
+    int seqs = 1;
     bool verbose = false;
 };
 
@@ -108,6 +119,26 @@ public:
     /// The same with the last `want` rows as candidates instead of logits (the tensor-parallel path picks them on the
     /// head's GPU: a few KB a row back instead of the vocabulary's 800).
     bool forward_cands(const int* ids, int n, int pos0, int want, Cands& c, std::string& err);
+    /// --parallel (Options::seqs): the sequences, and the one forward / forward_cands read and write (0 at the load).
+    int seqs() const;
+    void bind(int s);
+    /// One token of each of R conversations together (R <= 16, distinct sequences): ids[r] at position pos[r] of
+    /// sequence seq[r], whose cache holds its positions before it; logits_out [R][vocab].  Each row is the same bits as
+    /// that token's forward alone: the dense matrices on the token kernels' several columns, the routed experts on the
+    /// verify window's (each distinct expert read once for its rows), each row's attention on the token path's calls
+    /// over its own cache.
+    bool forward_rows(const int* ids, const int* seq, const int* pos, int R, float* logits_out, std::string& err);
+    /// --parallel on a layer split: the GPUs as a pipeline.  pipe_stages(): its GPUs (1: none - one GPU, the
+    /// tensor-parallel path, no fast decode, one sequence).  pipe_tick: a group of R rows (forward_rows' rows, R 0: none)
+    /// enters the first GPU - free after every tick - and every group in flight runs its GPU's layers, then moves one
+    /// GPU on; a group past the last GPU: its logits [R][vocab] for pipe_take (oldest first, with its tag).  Each row
+    /// the same bits as forward_rows'.  A sequence is in one group at most; forward / forward_rows only with none in
+    /// flight (pipe_busy() 0); pipe_drop() forgets them (after an error).
+    int pipe_stages() const;
+    int pipe_busy() const;
+    bool pipe_tick(const int* ids, const int* seq, const int* pos, int R, int tag, std::string& err);
+    bool pipe_take(int& tag, std::vector<float>& logits);
+    void pipe_drop();
     /// (the tensor-parallel path, whose prompt chunks go through its GPU groups as a pipeline: a whole prompt is one
     /// call) f(tokens of the call done) after each chunk, on the calling thread; false: no further chunk starts - the
     /// call returns true with done() of its tokens in the cache (the logits only when all are).  set_progress({}) ends
@@ -127,6 +158,19 @@ public:
     std::vector<std::string> info_lines() const;
     /// The Monitor's map of each GPU (serve/gpu_map.py's VRAM lines): what each part holds there, measured at the load.
     std::vector<std::string> vram_lines() const;
+    /// The prefill calibration (maya-mm3 --calibrate-prefill): the prompt chunk a forward takes (at most the chunk the
+    /// load sized its buffers for: chunk_max) and the prompt path's GEMM backend, changed between forwards.
+    int chunk() const;
+    int chunk_max() const;
+    void set_chunk(int c);
+    void set_prefill_gemm(int backend);
+    int prefill_gemm() const;
+    bool lt_available() const;
+    /// The calibration's key of this PC (its GPUs, their architecture, the GPU runtime and driver) and the file its
+    /// results are kept in (one line a PC; the load takes the line of its own PC); write_tune keeps `settings` for it.
+    std::string tune_key() const;
+    std::string tune_file() const;
+    bool write_tune(const std::string& settings, std::string& err) const;
     /// The routings counted so far (with the loaded profile's, if any) as a profile file.
     bool save_profile(const std::string& path, std::string& err) const;
     /// The DSpark draft (Options::dspark): its block (the most tokens a proposal has; 0 without the draft), and up to

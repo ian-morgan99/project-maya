@@ -1,8 +1,13 @@
 // src/mm3/mm3_dspark.cu - maya-mm3's DSpark draft (mm3_dspark.hpp).
 #include "mm3_dspark.hpp"
 
+#include <functional>
+
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "mm3_kernels.cuh"
@@ -29,6 +34,36 @@ namespace x3 = strata::mm3::exl3;
 
 namespace {
 const std::string DP = "dspark.language_model.model.dspark.";
+// MAYA_MM3_PROF=2: a proposal's parts timed (the host waits at each) and printed at the end
+struct DraftProf {
+    bool on = [] {
+        const char* v = std::getenv("MAYA_MM3_PROF");
+        return v != nullptr && std::atoi(v) == 2;
+    }();
+    double ms[4] = {};
+    long n = 0;
+    double last = 0;
+    static double now() {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+    void start(cudaStream_t s) {
+        if (!on) return;
+        cudaStreamSynchronize(s);
+        last = now();
+    }
+    void mark(cudaStream_t s, int part) {
+        if (!on) return;
+        cudaStreamSynchronize(s);
+        const double t = now();
+        ms[part] += 1e3 * (t - last);
+        last = t;
+    }
+    ~DraftProf() {
+        if (on && n > 0)
+            std::fprintf(stderr, "MM3 PROF draft: %ld proposals, layers %.2f head %.2f markov %.2f ms a proposal\n", n,
+                         ms[0] / n, ms[1] / n, ms[2] / n);
+    }
+};
 }
 
 struct Draft::Impl {
@@ -38,7 +73,13 @@ struct Draft::Impl {
     cublasHandle_t blas = nullptr;
     const x3::Mat* head = nullptr;
     const uint16_t* emb = nullptr;
+    std::function<void(int, uint16_t*)> emb_row;   // (set_emb_rows: a GGUF's table, dequantized a row at a time)
     std::vector<void*> owned;
+    // row id of the target's token table as BF16 into dst (D values)
+    void row(int id, uint16_t* dst) const {
+        if (emb_row) emb_row(id, dst);
+        else std::memcpy(dst, emb + (size_t) id * g.dim, (size_t) g.dim * 2);
+    }
     size_t bytes = 0;
     struct MX {   // an MXFP8 matrix [N][K] as stored: E4M3 weights, a UE8M0 scale every 32
         const uint8_t *w = nullptr, *s = nullptr;
@@ -51,6 +92,12 @@ struct Draft::Impl {
     };
     std::vector<L> L;
     uint16_t *fc = nullptr, *w1 = nullptr, *w2 = nullptr;
+    // fc's GEMMs in FP16 instead of BF16 where the GPU has no BF16 tensor cores (CUDA before sm_80: cuBLAS took a
+    // generic kernel there, ~1.2 ms a tap on a V100) - fc converted once at the load when every value fits FP16
+    bool fc16 = false;
+    float* apart = nullptr;   // window_attn's split partials (the block's queries)
+    float* mkpart = nullptr;  // markov_greedy's blocks' argmax
+    static constexpr int kSplits = 16;
     float *hid1 = nullptr, *fin1 = nullptr, *cw = nullptr, *cb = nullptr, *inv = nullptr;
     // scratch
     float *ctx = nullptr, *xn = nullptr, *h = nullptr, *q = nullptr, *kk = nullptr, *vv = nullptr, *att = nullptr;
@@ -63,6 +110,8 @@ struct Draft::Impl {
     uint16_t* anc = nullptr;   // (mapped) the anchor's embedding row, BF16
     float* maskf = nullptr;    // the mask token's embedding row, F32 (device)
     k::QRow* qh = nullptr;   // (mapped) a sampled proposal's distributions, a row a position
+    DraftProf prof;
+    bool anc_busy = false;   // a proposal enqueued that may still read anc (one that failed before its own wait)
 
     ~Impl() {
         cudaSetDevice(dev);
@@ -161,12 +210,13 @@ struct Draft::Impl {
         return true;
     }
 
-    // C [rows][N] F32 = X [rows][K] BF16 . W [N][K]^T BF16 (+ beta C)
+    // C [rows][N] F32 = X [rows][K] BF16 . W [N][K]^T BF16 (+ beta C) - both FP16 instead with f16
     bool gemm(const uint16_t* W, int N, int K, int ldw, const uint16_t* X, int rows, int ldx, float* C, int ldc,
-              float beta, std::string& err) {
+              float beta, std::string& err, bool f16 = false) {
         const float one = 1.0f;
-        DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, CUDA_R_16BF, ldw, X, CUDA_R_16BF, ldx,
-                        &beta, C, CUDA_R_32F, ldc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        const auto ty = f16 ? CUDA_R_16F : CUDA_R_16BF;   // (auto: the BLAS's own type name on HIP)
+        DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, N, rows, K, &one, W, ty, ldw, X, ty, ldx, &beta, C, CUDA_R_32F,
+                        ldc, CUBLAS_COMPUTE_32F, f16 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : CUBLAS_GEMM_DEFAULT));
         return true;
     }
 
@@ -217,6 +267,29 @@ struct Draft::Impl {
             !vec(pk, DP + "confidence_head.proj.weight", 0.0f, cw, (size_t) D + R, err) ||
             !vec(pk, DP + "confidence_head.proj.bias", 0.0f, cb, 1, err))
             return false;
+#if !defined(STRATA_USE_HIP)
+        {   // (fc in FP16 where BF16 has no tensor cores; MAYA_MM3_DSPARK_FC16=0 keeps BF16 everywhere)
+            cudaDeviceProp pr{};
+            const char* fv = std::getenv("MAYA_MM3_DSPARK_FC16");
+            if ((fv == nullptr || std::atoi(fv) != 0) && cudaGetDeviceProperties(&pr, dev) == cudaSuccess &&
+                pr.major < 8) {
+                const size_t n = (size_t) D * NT * D;
+                uint16_t* h = nullptr;
+                if (cudaMalloc(&h, n * 2) == cudaSuccess) {
+                    if (k::bf16_to_f16(fc, n, h, s)) {
+                        for (void*& x : owned)
+                            if (x == fc) x = h;
+                        cudaFree(fc);
+                        fc = h;
+                        fc16 = true;
+                    } else {
+                        cudaFree(h);
+                    }
+                }
+                cudaGetLastError();
+            }
+        }
+#endif
         L.resize((size_t) g.n_layers);
         for (int i = 0; i < g.n_layers; ++i) {
             const std::string P = DP + "layers." + std::to_string(i) + ".decoder_layer.";
@@ -236,6 +309,8 @@ struct Draft::Impl {
         k::rope_inv_freq(g.theta, g.n_rot, inv_h.data());
         const int Rw = max_rows, B = g.block;
         if (!alloc(mxpart, (size_t) 16 * 16 * std::max(D, std::max(Q, F)), err)) return false;
+        if (!alloc(apart, k::attn_part_floats(B, g.n_kv, kSplits), err) || !alloc(mkpart, k::markov_part_floats(), err))
+            return false;
         if (!alloc(inv, inv_h.size(), err) || !alloc(ctx, (size_t) Rw * D, err) || !alloc(xn, (size_t) Rw * D, err) ||
             !alloc(h, (size_t) B * D, err) || !alloc(q, (size_t) B * Q, err) || !alloc(kk, (size_t) Rw * KV, err) ||
             !alloc(vv, (size_t) Rw * KV, err) || !alloc(att, (size_t) B * Q, err) || !alloc(ao, (size_t) B * D, err) ||
@@ -253,7 +328,9 @@ struct Draft::Impl {
         DK(cudaHostAlloc((void**) &anc, (size_t) D * 2, cudaHostAllocMapped | cudaHostAllocPortable));
         {
             std::vector<float> mf((size_t) D);
-            const uint16_t* r = emb + (size_t) g.mask_id * D;
+            std::vector<uint16_t> mrow((size_t) D);
+            row(g.mask_id, mrow.data());
+            const uint16_t* r = mrow.data();
             for (int i = 0; i < D; ++i) {
                 const uint32_t u = (uint32_t) r[i] << 16;
                 std::memcpy(&mf[(size_t) i], &u, 4);
@@ -280,8 +357,9 @@ struct Draft::Impl {
     bool context_tap(int j, const float* rows, int n, std::string& err) {
         const int D = g.dim, NT = (int) g.taps.size();
         cudaSetDevice(dev);
-        k::to_bf16(rows, n, D, D, x16, D, s);
-        return gemm(fc + (size_t) j * D, D, D, NT * D, x16, n, D, ctx, D, j == 0 ? 0.0f : 1.0f, err);
+        if (fc16) k::to_f16(rows, n, D, D, x16, D, s);
+        else k::to_bf16(rows, n, D, D, x16, D, s);
+        return gemm(fc + (size_t) j * D, D, D, NT * D, x16, n, D, ctx, D, j == 0 ? 0.0f : 1.0f, err, fc16);
     }
 
     bool context_finish(int n, int pos0, std::string& err) {
@@ -307,8 +385,12 @@ struct Draft::Impl {
         cudaSetDevice(dev);
         // the block's embeddings: the anchor, then the mask token (the target's table, BF16 -> F32), and the
         // positions - made on the device (the anchor's row read where the host put it)
-        DK(cudaStreamSynchronize(s));   // (the last proposal done with anc)
-        std::memcpy(anc, emb + (size_t) anchor * D, (size_t) D * 2);
+        // (the last proposal done with anc: it waited for its drafts at its end, unless it failed before that - no
+        //  wait here otherwise, so the target's context rows queued before it go to the GPU with this proposal)
+        if (anc_busy) DK(cudaStreamSynchronize(s));
+        anc_busy = true;
+        row(anchor, anc);
+        prof.start(s);
         k::draft_block(anc, maskf, D, B, P, g.window, h, pos, lo, s);
         const float scale = 1.0f / std::sqrt((float) g.hd);
         for (auto& l : L) {
@@ -318,7 +400,7 @@ struct Draft::Impl {
             mxg(l.v, xn, B, D, vv, KV, 0.0f);
             k::qk_norm_rope(q, kk, vv, l.qn1, l.kn1, pos, B, g.n_head, g.n_kv, g.hd, g.n_rot, inv, g.eps, l.kc, l.vc,
                             s, ring);
-            k::window_attn(q, l.kc, l.vc, ring, lo, P + B - 1, B, g.n_head, g.n_kv, scale, att, s);
+            k::window_attn(q, l.kc, l.vc, ring, lo, P + B - 1, B, g.n_head, g.n_kv, scale, att, s, apart, kSplits);
             mxg(l.o, att, B, Q, h, D, 1.0f);   // h += attn Wo
             k::rms(h, l.post1, B, D, g.eps, xn, nullptr, s);
             mxg(l.g, xn, B, D, gt, F, 0.0f);
@@ -327,6 +409,7 @@ struct Draft::Impl {
             mxg(l.d, gt, B, F, h, D, 1.0f);   // h += mlp
         }
         k::rms(h, fin1, B, D, g.eps, hid, hid16, s);
+        prof.mark(s, 0);
         // (the target's head on mv, F32 inputs: one pass for the block's rows - gemm_rows took ~1.8 ms on the 3090)
         for (int c0 = 0; c0 < n;) {
             x3::MvJob j;
@@ -342,8 +425,14 @@ struct Draft::Impl {
             }
             c0 += j.ncol;
         }
+        prof.mark(s, 1);
         k::set_int(prev, anchor, s);
         for (int i = 0; i < n; ++i) {
+            // (greedy: the bias, the argmax and the confidence in two kernels - else the gathered row, the BLAS GEMV
+            //  and markov_pick / markov_sample)
+            if (!sa && k::markov_greedy(logit + (size_t) i * V, w2, w1, V, R, prev, out + i, cw, cb, hid + (size_t) i * D,
+                                        D, conf + i, mkpart, nullptr, s))
+                continue;
             k::gather_row(w1, R, prev, embb, embf, s);
             const float one = 1.0f, zero = 0.0f;
             DB(cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, V, 1, R, &one, w2, CUDA_R_16BF, R, embb, CUDA_R_16BF, R,
@@ -361,6 +450,9 @@ struct Draft::Impl {
         DK(cudaMemcpyAsync(host, out, (size_t) n * 4, cudaMemcpyDeviceToHost, s));
         DK(cudaMemcpyAsync(host + B, conf, (size_t) n * 4, cudaMemcpyDeviceToHost, s));
         DK(cudaStreamSynchronize(s));
+        prof.mark(s, 2);
+        ++prof.n;
+        anc_busy = false;
         drafts.assign(host, host + n);
         cf.resize((size_t) n);
         std::memcpy(cf.data(), host + B, (size_t) n * 4);
@@ -379,6 +471,7 @@ bool Draft::load(const Pack& pk, int dev, cudaStream_t s, cublasHandle_t blas, c
                  const uint16_t* emb, int max_rows, std::string& err) {
     return p->load(pk, dev, s, blas, head, emb, max_rows, err);
 }
+void Draft::set_emb_rows(std::function<void(int, uint16_t*)> f) { p->emb_row = std::move(f); }
 const DraftGeo& Draft::geo() const { return p->g; }
 bool Draft::context(const float* taps, int T, int pos0, std::string& err, size_t stride) {
     return p->context(taps, T, pos0, stride, err);
