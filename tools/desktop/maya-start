@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Starts Project Maya's installed GLM-5.3-Flash config on port 8080 - the desktop shortcut's half of "GLM: start".
+#
+# Maya and Strata share port 8080 and are never run at the same time (each wants the whole GPU and most of the
+# RAM), so this refuses when the port is taken instead of failing deep inside the server, and says which
+# shortcut to press.  The config is explicit: the folder also contains a DeepSeek config, and relying on Maya's
+# default would start the wrong model from this icon.
+set -u
+MAYA_DIR="/home/ian/Documents/VSCodeProjects/Maya/project-maya"
+MAYA_CONFIG="$MAYA_DIR/maya-maya-s-v2-iq2_xxs.json"
+PORT="${MAYA_PORT:-8080}"
+
+if ss -tln 2>/dev/null | grep -q ":$PORT "; then
+  echo "Port $PORT is already in use:"
+  ss -ltnp 2>/dev/null | grep ":$PORT " | sed 's/^/  /'
+  echo
+  if pgrep -f 'Strata[^ ]*/(serve/[s]erver.py|engine/[s]trata)' >/dev/null 2>&1; then
+    echo "That is Strata.  Maya and Strata share port $PORT and are never both running:"
+    echo "press Stop Strata first, then Start Maya again."
+  elif pgrep -f 'project-maya/serve/[s]erver.py' >/dev/null 2>&1; then
+    echo "That is Maya, already running: http://127.0.0.1:$PORT/"
+  else
+    echo "Something else holds the port.  Stop it, or start Maya on another one:"
+    echo "  MAYA_PORT=8081 maya-start"
+  fi
+  echo
+  read -r -p "Press Enter to close. " _
+  exit 1
+fi
+
+cd "$MAYA_DIR" || exit 1
+if [ ! -f "$MAYA_CONFIG" ]; then
+  echo "GLM-5.3-Flash config is missing: $MAYA_CONFIG"
+  exit 1
+fi
+args=(--config "$MAYA_CONFIG")
+[ -n "${MAYA_PORT:-}" ] && args+=(--port "$MAYA_PORT")
+exec ./maya.sh "${args[@]}" "$@"

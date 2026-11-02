@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Stops Project Maya - the desktop shortcut's half of "Maya: stop".
+#
+# Two things the obvious one-liner gets wrong (same reasoning as the "Maya: stop" task in .vscode/tasks.json):
+# killing only the engine stops nothing, because serve/server.py notices it gone and starts it again, so the
+# server goes first; the engine then ends by itself when the server's pipe closes, and the second pkill is only
+# a guard for an engine left over from an older crash.  The patterns are bracketed ([s]) so pkill never matches
+# the shell running this script.
+set -u
+found=0
+
+if pkill -f 'project-maya/serve/[s]erver.py' 2>/dev/null; then
+  echo "Stopped the Maya server."
+  found=1
+fi
+sleep 2
+if pkill -f 'project-maya/build/[s]trata($| )' 2>/dev/null || \
+   pkill -f 'project-maya/build/[m]aya($| )' 2>/dev/null || \
+   pkill -f 'project-maya/build/[m]aya-ds4($| )' 2>/dev/null || \
+   pkill -f 'project-maya/build/[m]aya-mm3($| )' 2>/dev/null; then
+  found=1
+fi
+
+if [ "$found" = 1 ]; then
+  # the engine pins most of the free RAM for its expert tier; wait for it to hand that back
+  for _ in $(seq 1 30); do
+    pgrep -f 'project-maya/build/[s]trata($| )' >/dev/null 2>&1 || \
+      pgrep -f 'project-maya/build/[m]aya($| )' >/dev/null 2>&1 || \
+      pgrep -f 'project-maya/build/[m]aya-ds4($| )' >/dev/null 2>&1 || \
+      pgrep -f 'project-maya/build/[m]aya-mm3($| )' >/dev/null 2>&1 || break
+    sleep 1
+  done
+  pkill -KILL -f 'project-maya/build/[s]trata($| )' 2>/dev/null
+  pkill -KILL -f 'project-maya/build/[m]aya($| )' 2>/dev/null
+  pkill -KILL -f 'project-maya/build/[m]aya-ds4($| )' 2>/dev/null
+  pkill -KILL -f 'project-maya/build/[m]aya-mm3($| )' 2>/dev/null
+  echo "Maya stopped."
+else
+  echo "Maya was not running."
+fi
+
+sleep 2
