@@ -6,11 +6,12 @@ import {MOD, api, ctxfmt, fmt, gb, isPhone, modelName, store} from "./lib.js";
 import {DEFAULTS, LEVELS, P, PENALTIES, PRESETS, S, confirmDialog, copyText, emit, presetOf, resetPrefs, savePrefs, schemeChoice, setScheme, setTheme,
         themeChoice, thinkTitles, toast} from "./state.js";
 import {usd} from "./sidebar.js";
-import {confirmContext, confirmPort, ctxEstimate, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
-        loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
+import {GLM_KV_BYTES, confirmContext, confirmPort, ctxEstimate, ctxHint, ctxStops, fetchReport, loadCtxInfo, loadMcp, loadPortInfo, loadShared,
+        budgetError, loadThinkBudget, saveThinkBudget, loadTime, loadUpdate, saveShared, startUpdate, syncShared} from "./server.js";
 import {chatInstructions, clearBrowser, estimateTokens, updateCtxMeter} from "./chats.js";
 import {codeBlock, onCodeClick} from "./md.js";
-import {Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
+import {TurboButton} from "./turbo.js";
+import {CtxSlider, Icon, Kbd, ModelLogo, Seg, Switch, trapTab} from "./ui.js";
 
 const SECTIONS = [
   {id: "general", label: "General", icon: "settings"},
@@ -58,12 +59,10 @@ function Model() {
   const v = ctx != null && stops[ctx] ? stops[ctx] : c && c.context;
   const changed = c && v !== c.context && !S.reload;
   const e = c ? ctxEstimate(v) : null;
-  let est = "How much text the model holds at once: the chat, files and tool output. More context takes GPU memory from the experts, so answers get a little slower.";
-  if (S.reload) est = `Reloading with a ${ctxfmt(S.reload.to)} context…`;
-  else if (e && e.ram) est = `≈ ${fmt(e.gb, 1)} GB of RAM for the context (kept pinned; its newest ${ctxfmt(c.kv_resident)} positions also in VRAM)` +
-    (v === c.context ? "." : ` · ${fmt(Math.abs(e.delta), 1)} GB ${e.delta > 0 ? "more" : "less"} than now.`);
-  else if (e) est = `≈ ${fmt(e.gb, 1)} GB of GPU memory for the context` + (v === c.context ? "." :
-    e.experts ? ` · about ${fmt(Math.abs(e.experts))} ${e.experts > 0 ? "fewer" : "more"} experts held in VRAM than now${e.experts > 0 ? " (answers a little slower)" : ""}.` : ".");
+  // (the same line as the Models page's slider: the engine's measurement; GLM's streamed cache: 12 KB a token in RAM)
+  const glmWin = eng.engine_kind === "glm-fast" && c && +c.kv_resident > 0 ? +c.kv_resident : 0;
+  const est = S.reload ? `Reloading with a ${ctxfmt(S.reload.to)} context…`
+    : ctxHint(v, {live: true, now: c && c.context, win: glmWin, whole: true, ram: glmWin ? GLM_KV_BYTES : 0});
   const warns = [];
   if (c && changed) {
     const tested = c.tested || 262144;   // (the largest context run end to end on this engine)
@@ -84,12 +83,8 @@ function Model() {
     <div class="model-card"><${ModelLogo} model=${h.model} size=${36}/>
       <span><b>${modelName(h.model)}</b><span>${[h.model, engine, h.version ? `Project Maya v${h.version}` : ""].filter(Boolean).join(" · ")}</span></span></div>
     ${c ? html`<div class="set-block">
-      <label for="set-ctx" class="set-split"><span>Context size</span>
-        <b class="num">${ctxfmt(v)} tokens${v === c.context ? " · now" : ""}</b></label>
-      <input id="set-ctx" type="range" class="range" min="0" max=${stops.length - 1} step="1" disabled=${!!S.reload}
-        value=${Math.max(0, stops.indexOf(v))} onInput=${(ev) => setCtx(+ev.target.value)}/>
-      <span class="set-split set-split--muted"><span>${ctxfmt(stops[0])}</span><span>${ctxfmt(stops[stops.length - 1])}</span></span>
-      <span class="set-row__sub">${est}</span>
+      <${CtxSlider} id="set-ctx" value=${v} now=${c.context} stops=${stops} disabled=${!!S.reload} hint=${est}
+        onChange=${(n) => setCtx(stops.indexOf(n))}/>
       ${changed ? html`<div class="callout callout--warn"><span>${warns.join(" ")}</span>
         <button type="button" class="btn btn--primary btn--sm" onClick=${reload}>Reload with ${ctxfmt(v)}</button></div>` : null}
     </div>` : html`<p class="set-note">This server does not say its context range, so it can't be changed from here.</p>`}
@@ -102,6 +97,23 @@ function Model() {
                         : `Saved for the next start: this server was not started by Maya's start script, so it stays on ${pi.port} until then.`}</span>
         ${pv >= 1024 && pv <= 65535 ? html`<button type="button" class="btn btn--primary btn--sm" onClick=${() => confirmPort(pv)}>Move to ${pv}</button>` : null}
       </div>` : null}` : null}`;
+}
+
+// ------------------------------------------------------------------ Thinking budget (the model's run config; applies at once)
+function ThinkBudget() {
+  const tb = S.thinkBudget, [text, setText] = useState("");
+  useEffect(() => { if (tb) setText(String(tb.budget)); }, [tb && tb.budget]);
+  if (!tb || !tb.supported) return null;
+  const bad = budgetError(text), changed = text.trim() !== String(tb.budget);
+  return html`<div class="set-block">
+    <label class="field"><span class="field__label">Thinking budget</span>
+      <span class="set-row__sub">Tokens, 0 = no limit. Thinking stops at this many tokens and the answer starts.${tb.saved ? "" : " Not saved: this server runs without a config."}</span>
+      <span class="set-row__ctl"><input id="set-think-budget" class="input input--num" inputmode="numeric" value=${text}
+        aria-invalid=${changed && bad ? "true" : "false"} aria-label="Thinking budget in tokens"
+        onInput=${(e) => setText(e.target.value.replace(/\D/g, ""))}
+        onKeyDown=${(e) => { if (e.key === "Enter" && changed && !bad) saveThinkBudget(text); }}/>
+      ${changed ? html`<button type="button" class="btn btn--primary btn--sm" disabled=${!!bad} onClick=${() => saveThinkBudget(text)}>Save</button>` : null}</span></label>
+    ${changed && bad ? html`<span class="set-row__sub" role="alert">${bad}</span>` : null}</div>`;
 }
 
 // ------------------------------------------------------------------ Chat defaults (sampling)
@@ -131,7 +143,7 @@ function ChatDefaults() {
   const sharedNow = S.shared.on && S.shared.now && Object.keys(S.shared.now).length
     ? "API clients get now: " + Object.entries(S.shared.now).map(([k, v]) => `${names[k] || k} ${v}`).join(", ")
     : "API clients get them for anything they don't set themselves.";
-  return html`<h3>Chat defaults</h3>
+  return html`<div class="set-head"><h3>Chat defaults</h3><${TurboButton}/></div>
     <p class="set-intro">How ${modelName(S.health.model)} writes new answers. Each model keeps its own.</p>
     <${Row} label="Presets"><${Seg} label="Presets" value=${preset} onChange=${(id) => set(PRESETS[id])}
       options=${[{id: "precise", label: "Precise", title: "Temperature 0: the same question gives the same answer"},
@@ -156,6 +168,7 @@ function ChatDefaults() {
         <input class="input" inputmode="numeric" placeholder="Random" value=${P.seed}
           onInput=${(e) => set({seed: e.target.value.replace(/\D/g, "")})}/></label>
     </div>
+    <${ThinkBudget}/>
     <p class="set-row__sub">Penalties: none by default (no model has any as a standard). Set one to discourage repeats.</p>
     <div class="set-pair set-pair--3">
       ${[["repetition_penalty", "Repetition", "1.0 off, e.g. 1.1"], ["frequency_penalty", "Frequency", "0 off, e.g. 0.3"],
@@ -440,7 +453,7 @@ export function SettingsDialog() {
   const box = useRef(null), body = useRef(null);
   const sec = BODIES[S.settings] ? S.settings : "general";
   useEffect(() => {
-    loadShared(); loadMcp(); loadCtxInfo(); loadPortInfo(); loadUpdate();
+    loadShared(); loadMcp(); loadCtxInfo(); loadPortInfo(); loadThinkBudget(); loadUpdate();
     const ret = document.activeElement;
     setTimeout(() => { const b = box.current && box.current.querySelector(".set-nav [aria-current=page]"); if (b) b.focus(); }, 0);
     return () => { if (ret && ret.focus && document.contains(ret)) ret.focus(); };

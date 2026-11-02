@@ -39,11 +39,36 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/sysmacros.h>   // major(), minor(): the drive probe's cache key
+#endif
 #endif
 
 namespace strata::core {
 
 namespace detail {
+
+int pick_reads_at_once(const std::vector<int>& counts, const std::vector<double>& mbps, double tol) {
+    double best = 0;
+    for (size_t i = 0; i < counts.size() && i < mbps.size(); ++i) best = std::max(best, mbps[i]);
+    if (best <= 0) return 0;
+    for (size_t i = 0; i < counts.size() && i < mbps.size(); ++i)
+        if (mbps[i] >= (1.0 - tol) * best) return counts[i];
+    return 0;
+}
+
+int cached_reads_at_once(const std::string& text, const std::string& key) {
+    int n = 0;
+    std::istringstream in(text);
+    for (std::string line; std::getline(in, line);) {
+        if (line.size() <= key.size() || line.compare(0, key.size(), key) != 0 || line[key.size()] != ' ') continue;
+        const size_t at = line.find(" reads=", key.size());
+        if (at == std::string::npos) continue;
+        const int v = std::atoi(line.c_str() + at + 7);
+        if (v > 0) n = v;
+    }
+    return n;
+}
 
 bool cgroup_available_bytes(uint64_t limit, const CgroupMemoryStat& stat, uint64_t& bytes) {
     bytes = 0;
@@ -1384,13 +1409,109 @@ uint64_t total_memory_bytes() {
     return pages > 0 && page > 0 ? (uint64_t) pages * (uint64_t) page : 0;
 #endif
 }
+
+#if defined(__linux__)
+// How many unbuffered reads at once the drive under the model file serves fastest - the stagers' count when
+// MAYA_EXPERT_STAGERS names none.  It belongs to the drive, not the CPU: an NVMe reads ~10% faster with 8 slices in
+// flight than with 3, a USB disk gains nothing past 2.  Measured once (~1 s: 2, 4, 8 and 16 threads reading
+// `piece`-sized slices at random places of the file, twice over, interleaved) and cached per drive in
+// <XDG_CONFIG_HOME or ~/.config>/project-maya/drive-reads.txt; MAYA_EXPERT_DRIVE_PROBE=0 skips it.  0: not measured
+// (the caller keeps its own count).
+int drive_reads_at_once(int dfd, uint64_t file_bytes, uint64_t piece, std::string& said) {
+    const char* off = std::getenv("MAYA_EXPERT_DRIVE_PROBE");
+    if ((off != nullptr && std::atoi(off) == 0) || dfd < 0) return 0;
+    struct stat st{};
+    if (::fstat(dfd, &st) != 0) return 0;
+    piece = std::max<uint64_t>(65536, (piece + 4095) & ~uint64_t{4095});
+    if (file_bytes < 64 * piece) return 0;
+    // the drive: its device numbers, the block device's name and size (a renumbered disk is measured again)
+    const unsigned mj = major(st.st_dev), mn = minor(st.st_dev);
+    const std::string sys = "/sys/dev/block/" + std::to_string(mj) + ":" + std::to_string(mn);
+    std::error_code ec;
+    std::string name = std::filesystem::canonical(sys, ec).filename().string(), size;
+    if (ec || name.empty()) name = "dev";
+    {
+        std::ifstream f(sys + "/size");
+        std::getline(f, size);
+    }
+    const std::string key = name + ":" + std::to_string(mj) + ":" + std::to_string(mn) + ":" + (size.empty() ? "0" : size);
+    const char* xdg = std::getenv("XDG_CONFIG_HOME");
+    const char* home = std::getenv("HOME");
+    if ((xdg == nullptr || !*xdg) && (home == nullptr || !*home)) return 0;
+    const std::filesystem::path dir = (xdg != nullptr && *xdg) ? std::filesystem::path(xdg) / "project-maya"
+                                                                : std::filesystem::path(home) / ".config" / "project-maya";
+    const std::filesystem::path cache = dir / "drive-reads.txt";
+    std::string text;
+    {
+        std::ifstream f(cache);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        text = ss.str();
+    }
+    if (const int n = detail::cached_reads_at_once(text, key); n > 0) {
+        said = std::to_string(n) + " reads at once on " + name + " (cached in " + cache.string() + ")";
+        return n;
+    }
+    const std::vector<int> counts = {2, 4, 8, 16};
+    std::vector<double> mbps(counts.size(), 0.0);
+    const uint64_t slots = (file_bytes - piece) / 4096;
+    bool failed = false;
+    for (int round = 0; round < 2 && !failed; ++round)
+        for (size_t k = 0; k < counts.size() && !failed; ++k) {
+            std::atomic<uint64_t> bytes{0};
+            std::atomic<bool> bad{false};
+            const auto t0 = std::chrono::steady_clock::now();
+            const auto until = t0 + std::chrono::milliseconds(120);
+            std::vector<std::thread> th;
+            for (int t = 0; t < counts[k]; ++t)
+                th.emplace_back([&, t] {
+                    void* buf = nullptr;
+                    if (posix_memalign(&buf, 4096, (size_t) piece) != 0) { bad = true; return; }
+                    uint64_t x = 0x9E3779B97F4A7C15ull * (uint64_t) (1 + t + 64 * (round * 8 + (int) k));
+                    do {   // (each thread's first read always runs: a slow disk still gives every count a reading)
+                        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+                        const ssize_t r = ::pread(dfd, buf, (size_t) piece, (off_t) ((x % slots) * 4096));
+                        if (r != (ssize_t) piece) { bad = true; break; }
+                        bytes += (uint64_t) r;
+                    } while (std::chrono::steady_clock::now() < until);
+                    std::free(buf);
+                });
+            for (auto& x : th) x.join();
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            if (bad) failed = true;
+            else if (s > 0) mbps[k] = std::max(mbps[k], (double) bytes.load() / 1e6 / s);
+        }
+    const int n = failed ? 0 : detail::pick_reads_at_once(counts, mbps);
+    if (n <= 0) return 0;
+    char line[256];
+    std::snprintf(line, sizeof line, "%s reads=%d mbps=%.0f/%.0f/%.0f/%.0f piece=%llu\n", key.c_str(), n, mbps[0], mbps[1],
+                  mbps[2], mbps[3], (unsigned long long) piece);
+    std::filesystem::create_directories(dir, ec);
+    if (std::FILE* f = std::fopen(cache.string().c_str(), "a")) {
+        std::fputs(line, f);
+        std::fclose(f);
+    }
+    char b[200];
+    std::snprintf(b, sizeof b, "%d reads at once on %s (measured %.0f/%.0f/%.0f/%.0f MB/s at 2/4/8/16)", n, name.c_str(),
+                  mbps[0], mbps[1], mbps[2], mbps[3]);
+    said = b;
+    return n;
+}
+#endif
 }  // namespace
 
-uint64_t expert_ram_room(uint64_t* avail_out, uint64_t* headroom_out) {
+uint64_t expert_ram_room(uint64_t* avail_out, uint64_t* headroom_out, bool unbuffered) {
     uint64_t avail = 0;
     const uint64_t total = total_memory_bytes();
     if (!available_memory_bytes(avail)) avail = total / 2;   // (no reading of it: assume half the RAM is free)
-    const uint64_t headroom = std::max<uint64_t>(6ull << 30, total / 100 * 12);
+    // the file cache the other experts are read through needs this much; read unbuffered (O_DIRECT) they need none, and
+    // the OS, the server and the engine's own buffers are what stays free
+    uint64_t headroom = unbuffered ? std::max<uint64_t>(4ull << 30, total / 100 * 8)
+                                   : std::max<uint64_t>(6ull << 30, total / 100 * 12);
+    if (const char* v = std::getenv("MAYA_EXPERT_HEADROOM_GB")) {   // (a measurement knob)
+        const double gb = std::atof(v);
+        if (gb >= 0.0) headroom = (uint64_t) (gb * 1073741824.0);
+    }
     if (avail_out) *avail_out = avail;
     if (headroom_out) *headroom_out = headroom;
     return avail > headroom ? avail - headroom : 0;
@@ -1399,12 +1520,12 @@ uint64_t expert_ram_room(uint64_t* avail_out, uint64_t* headroom_out) {
 GgufExpertSource::~GgufExpertSource() { close(); }
 
 struct GgufExpertSource::Stage {
-    struct Task { int64_t slot, layer, expert; };
+    struct Task { int64_t slot, layer, expert; int part; };   ///< part: 0..2 one slice, -1 the whole expert
     std::mutex mu;
     std::condition_variable cv;
     std::deque<Task> queue;
     std::vector<std::thread> threads;
-    std::unique_ptr<std::atomic<int>[]> busy;   ///< per ring slot: 1 while a stager writes it
+    std::unique_ptr<std::atomic<int>[]> busy;   ///< per ring slot: the slices (1: whole) a stager still has to write
     bool quit = false;
 };
 
@@ -1418,8 +1539,10 @@ void GgufExpertSource::stage_worker() {
             t = st_->queue.front();
             st_->queue.pop_front();
         }
-        assemble(t.layer, t.expert, ring_.data() + (size_t) t.slot * ring_stride_);
-        st_->busy[(size_t) t.slot].store(0, std::memory_order_release);
+        uint8_t* dst = ring_.data() + (size_t) t.slot * ring_stride_;
+        if (t.part >= 0) assemble_part(t.layer, t.expert, t.part, dst);
+        else assemble(t.layer, t.expert, dst);
+        st_->busy[(size_t) t.slot].fetch_sub(1, std::memory_order_release);
     }
 }
 
@@ -1466,6 +1589,7 @@ void GgufExpertSource::close() {
 #else
         if (m.base != nullptr) munmap((void*) m.base, (size_t) m.bytes);
         if (m.fd >= 0) ::close(m.fd);
+        if (m.dfd >= 0) ::close(m.dfd);
 #endif
     }
     maps_.clear();
@@ -1537,6 +1661,23 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
             m.fd = fd;
             m.base = (const uint8_t*) view;
             m.bytes = (uint64_t) st.st_size;
+#if defined(__linux__) && defined(O_DIRECT)
+            // the misses are read unbuffered, a slice per read, many at once: through the mapping a miss is a run of
+            // 4 KB page faults and the file cache (small beside a model this size) churns the RAM the experts need.
+            // MAYA_EXPERT_DIRECT=0 turns it off; a file system that refuses O_DIRECT keeps the mapping.
+            const char* dv = std::getenv("MAYA_EXPERT_DIRECT");
+            if (dv == nullptr || std::atoi(dv) != 0) {
+                const int dfd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+                void* probe = nullptr;
+                if (dfd >= 0 && posix_memalign(&probe, 4096, 4096) == 0) {
+                    if (::pread(dfd, probe, 4096, 0) == 4096) m.dfd = dfd;
+                    else ::close(dfd);
+                    std::free(probe);
+                } else if (dfd >= 0) {
+                    ::close(dfd);
+                }
+            }
+#endif
 #endif
             maps_.push_back(m);
             at = (int) maps_.size() - 1;
@@ -1567,19 +1708,61 @@ bool GgufExpertSource::open(const std::string& shard1, int64_t n_layers, int64_t
     ring_of_.assign((size_t) (n_layers * n_expert), -1);
     res_off_.assign((size_t) (n_layers * n_expert), kNone);
     pf_stamp_.assign((size_t) (n_layers * n_expert), -1);
-    // the stagers: a quarter of the hardware threads, 2 to 8 (MAYA_EXPERT_STAGERS sets it; 0: blob() assembles alone)
+    // the stagers: a quarter of the hardware threads, 2 to 8 (MAYA_EXPERT_STAGERS sets it; 0: blob() assembles alone) -
+    // or, where the misses are read unbuffered (Linux), the reads at once the drive serves fastest (measured once a drive)
     int stagers = std::clamp((int) std::thread::hardware_concurrency() / 4, 2, 8);
-    if (const char* v = std::getenv("MAYA_EXPERT_STAGERS")) stagers = std::clamp(std::atoi(v), 0, 64);
+    std::string drive_said;
+    if (const char* v = std::getenv("MAYA_EXPERT_STAGERS")) {
+        stagers = std::clamp(std::atoi(v), 0, 64);
+    } else {
+#if defined(__linux__)
+        const Map* big = nullptr;
+        bool all_direct = !maps_.empty();
+        for (const Map& m : maps_) {
+            all_direct = all_direct && m.dfd >= 0;
+            if (big == nullptr || m.bytes > big->bytes) big = &m;
+        }
+        if (all_direct && big != nullptr) {
+            const int n = drive_reads_at_once(big->dfd, big->bytes, (uint64_t) lay.max_blob / 3, drive_said);
+            if (n > 0) stagers = n;
+        }
+#endif
+    }
     if (stagers > 0) {
         st_ = new Stage();
         st_->busy.reset(new std::atomic<int>[(size_t) ring_n_]);
         for (int64_t i = 0; i < ring_n_; ++i) st_->busy[(size_t) i].store(0);
         for (int i = 0; i < stagers; ++i) st_->threads.emplace_back([this] { stage_worker(); });
     }
+    direct_ = st_ != nullptr && !maps_.empty();
+#if !defined(_WIN32)
+    for (const Map& m : maps_) if (m.dfd < 0) direct_ = false;
+#else
+    direct_ = false;
+#endif
+    if (direct_) {   // a sample of experts read both ways must agree, or the mapping stays the way the misses are read
+        const auto& lay2 = strata::kernels::cpu::expert_layout();
+        std::vector<uint8_t> tmp((size_t) lay2.max_blob + 4096);
+        const int64_t sample[3][2] = {{0, 0}, {n_layers - 1, n_expert - 1}, {n_layers / 2, n_expert / 3}};
+        for (const auto& pr : sample) {
+            const uint8_t* src[3];
+            uint64_t bytes[3], off[3];
+            parts(pr[0], pr[1], src, bytes, off);
+            const auto& fm = lay2.fmt[(size_t) pr[0]];
+            for (int r = 0; r < 3 && direct_; ++r) {
+                const uint64_t at = r == 0 ? 0 : r == 1 ? fm.up_off : fm.down_off;
+                if (!read_part_direct(pr[0], pr[1], r, tmp.data()) || std::memcmp(tmp.data() + at, src[r], (size_t) bytes[r]) != 0)
+                    direct_ = false;
+            }
+        }
+        if (!direct_) std::fprintf(stderr, "GgufExpertSource: the unbuffered read of a sample expert differs from the mapping - the misses are read through the mapping\n");
+    }
     char buf[256];
     std::snprintf(buf, sizeof buf, "experts read from the model file (%zu mapped), a staging ring of %lld (%.0f MiB), "
-                  "%d stagers", maps_.size(), (long long) ring_n_, (double) ring_.size() / 1048576.0, stagers);
+                  "%d stagers%s", maps_.size(), (long long) ring_n_, (double) ring_.size() / 1048576.0, stagers,
+                  direct_ ? ", unbuffered slice reads" : "");
     note_ = buf;
+    if (!drive_said.empty()) note_ += " - " + drive_said;
     return true;
 }
 
@@ -1608,6 +1791,57 @@ void GgufExpertSource::assemble(int64_t layer, int64_t expert, uint8_t* dst) con
     std::memcpy(dst + fm.down_off, src[2], (size_t) bytes[2]);
 }
 
+bool GgufExpertSource::read_part_direct(int64_t layer, int64_t expert, int part, uint8_t* dst) const {
+#if defined(__linux__)
+    const Map& m = maps_[(size_t) map_of_[(size_t) layer]];
+    if (m.dfd < 0) return false;
+    const uint8_t* src[3];
+    uint64_t bytes[3], off[3];
+    parts(layer, expert, src, bytes, off);
+    const auto& fm = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
+    uint8_t* to = part == 0 ? dst : part == 1 ? dst + fm.up_off : dst + fm.down_off;
+    // the read is rounded out to 4 KB (O_DIRECT) into this thread's bounce buffer, then the slice copied out
+    struct Bounce {
+        uint8_t* p = nullptr;
+        size_t cap = 0;
+        ~Bounce() { std::free(p); }
+    };
+    static thread_local Bounce bn;
+    const uint64_t a0 = off[part] & ~uint64_t{4095}, head = off[part] - a0, need = head + bytes[part];
+    const uint64_t len = (need + 4095) & ~uint64_t{4095};
+    if (bn.cap < len) {
+        std::free(bn.p);
+        bn.p = nullptr;
+        bn.cap = 0;
+        void* q = nullptr;
+        if (posix_memalign(&q, 4096, (size_t) len + (1u << 20)) != 0) return false;
+        bn.p = (uint8_t*) q;
+        bn.cap = (size_t) len + (1u << 20);
+    }
+    uint64_t got = 0;
+    while (got < need) {
+        const ssize_t r = ::pread(m.dfd, bn.p + got, (size_t) (len - got), (off_t) (a0 + got));
+        if (r <= 0) return false;
+        got += (uint64_t) r;
+        if (got < need && (got & 4095) != 0) return false;
+    }
+    std::memcpy(to, bn.p + head, (size_t) bytes[part]);
+    return true;
+#else
+    (void) layer; (void) expert; (void) part; (void) dst;
+    return false;
+#endif
+}
+
+void GgufExpertSource::assemble_part(int64_t layer, int64_t expert, int part, uint8_t* dst) const {
+    if (read_part_direct(layer, expert, part, dst)) return;
+    const uint8_t* src[3];
+    uint64_t bytes[3], off[3];
+    parts(layer, expert, src, bytes, off);
+    const auto& fm = strata::kernels::cpu::expert_layout().fmt[(size_t) layer];
+    std::memcpy(part == 0 ? dst : part == 1 ? dst + fm.up_off : dst + fm.down_off, src[part], (size_t) bytes[part]);
+}
+
 bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_t>>& order, uint64_t budget,
                                      uint64_t max_pinned, int threads,
                                      const std::vector<std::pair<int32_t, int32_t>>& drop, std::string& err) {
@@ -1617,7 +1851,7 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
     // ---- the budget: this PC's available RAM less a headroom for the OS and the page cache the other experts and
     // the n-gram rows are read through (12% of the RAM, at least 6 GiB); MAYA_EXPERT_RAM_GB caps it
     uint64_t avail = 0, headroom = 0;
-    uint64_t room = expert_ram_room(&avail, &headroom);
+    uint64_t room = expert_ram_room(&avail, &headroom, direct_);
     if (budget > 0) room = std::min(room, budget);
     if (const char* v = std::getenv("MAYA_EXPERT_RAM_GB")) {
         const double gb = std::atof(v);
@@ -1740,6 +1974,7 @@ bool GgufExpertSource::make_resident(const std::vector<std::pair<int32_t, int32_
     pinned_bytes_ = std::min(registered_bytes_, at);
     uint64_t all = 0;
     for (int64_t l = 0; l < n_layers_; ++l) all += lay.bytes[(size_t) l] * (uint64_t) n_expert_;
+    all_bytes_ = all;
     char buf[400];
     std::snprintf(buf, sizeof buf,
                   "%lld experts (%.2f GiB of %.2f) resident in RAM (%.2f GiB pinned), the rest read from the model "
@@ -1766,7 +2001,8 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
         return ring_.data() + (size_t) s0 * ring_stride_;
     }
     uint8_t* dst = ring_.data() + (size_t) take_slot(i) * ring_stride_;
-    assemble(layer, expert, dst);
+    if (direct_) for (int r = 0; r < 3; ++r) assemble_part(layer, expert, r, dst);
+    else assemble(layer, expert, dst);
     return dst;
 }
 
@@ -1837,15 +2073,22 @@ void GgufExpertSource::begin_layer(int64_t layer, const int32_t* ids, int64_t k)
             if (nb == 63) { (void) prefetch(GetCurrentProcess(), (ULONG_PTR) nb, batch, 0); nb = 0; }
         }
 #elif defined(POSIX_FADV_WILLNEED)
-        const int fd = maps_[(size_t) map_of_[(size_t) layer]].fd;
-        for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_WILLNEED);
+        if (!direct_) {   // (unbuffered reads fill their own ring slots: nothing to read ahead into the page cache)
+            const int fd = maps_[(size_t) map_of_[(size_t) layer]].fd;
+            for (int r = 0; r < 3; ++r) (void) ::posix_fadvise(fd, (off_t) off[r], (off_t) bytes[r], POSIX_FADV_WILLNEED);
+        }
 #else
         (void) src; (void) bytes; (void) off;
 #endif
         if (st_ != nullptr) {   // its slot now; a stager assembles it while the pool quantizes the activation
             const int64_t s = take_slot(i);
-            st_->busy[(size_t) s].store(1, std::memory_order_release);
-            tasks.push_back({s, layer, e});
+            if (direct_) {   // a task a slice: the SSD sees three reads for it, spread over the stagers
+                st_->busy[(size_t) s].store(3, std::memory_order_release);
+                for (int r = 0; r < 3; ++r) tasks.push_back({s, layer, e, r});
+            } else {
+                st_->busy[(size_t) s].store(1, std::memory_order_release);
+                tasks.push_back({s, layer, e, -1});
+            }
         }
     }
 #if defined(_WIN32)

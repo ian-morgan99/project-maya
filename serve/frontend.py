@@ -29,6 +29,8 @@ from pathlib import Path
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
+from serve.response_schema import json_instruction, with_system_note
+
 
 # ------------------------------------------------------------------------------------------------ template
 class ChatTemplate:
@@ -459,6 +461,19 @@ def stable_tool_order(tools: list[dict] | None) -> list[dict] | None:
     return sorted(tools, key=lambda t: pos[t["name"]])
 
 
+def _json_format_note(req: dict, messages: list[dict]) -> list[dict]:
+    """response_format json_object / json_schema: the model is told to answer in JSON, with the schema when there is
+    one (OpenAI's json_schema.schema, or llama.cpp's response_format.schema), as the Responses API tells it.  The
+    answer is still held and its JSON sent alone at the end (server.openai_chunks); nothing checks it against the
+    schema."""
+    rf = req.get("response_format")
+    if not isinstance(rf, dict) or rf.get("type") not in ("json_object", "json_schema"):
+        return messages
+    spec = rf.get("json_schema")
+    schema = spec.get("schema") if isinstance(spec, dict) else rf.get("schema")
+    return with_system_note(messages, json_instruction(schema if isinstance(schema, dict) else None))
+
+
 def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     if deepseek:
@@ -488,7 +503,10 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         # Unlike the legacy adapter, preserve tool IDs, namespaces, content_blocks,
         # mid-system roles, latest_reminder and task fields for the reference encoder.
         declared = copy.deepcopy(req.get("tools") or [])
-        tools = tools_from_openai_format(declared) if declared else None
+        # same stabilization as the legacy branch - the encoder renders tools at the prompt's head,
+        # so a client's registration-order swap would otherwise break the engine's prompt-prefix reuse.
+        # tools_from_openai_format already returns flat dicts keyed by the namespace-qualified name.
+        tools = stable_tool_order(tools_from_openai_format(declared)) if declared else None
         if req.get("tool_choice") == "none":
             tools = None
             for message in messages:
@@ -510,7 +528,7 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
             if choice.get("namespace") is not None:
                 function["namespace"] = choice["namespace"]
             kwargs["_force_tool"] = _tool_name_for_encoding(function) if function.get("name") else ""
-        return messages, tools, kwargs
+        return _json_format_note(req, messages), tools, kwargs
     messages = []
     for m in req.get("messages", []):
         role = m.get("role")
@@ -551,7 +569,7 @@ def openai_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], l
         kwargs["_force_tool"] = ""
     elif tools and isinstance(tc, dict) and tc.get("type") == "function" and (tc.get("function") or {}).get("name"):
         kwargs["_force_tool"] = tc["function"]["name"]
-    return _late_system_to_user(messages), tools, kwargs
+    return _late_system_to_user(_json_format_note(req, messages)), tools, kwargs
 
 
 def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict], list[dict] | None, dict]:
@@ -598,8 +616,7 @@ def anthropic_to_messages(req: dict, deepseek: bool = False) -> tuple[list[dict]
             messages.append(out)
     tools = [{"name": t["name"], "description": t.get("description", ""),
               "parameters": t.get("input_schema", {})} for t in req.get("tools") or []] or None
-    if not deepseek:
-        tools = stable_tool_order(tools)
+    tools = stable_tool_order(tools)   # DeepSeek renders tools at the prompt's head too
     if isinstance(req.get("tool_choice"), dict) and req["tool_choice"].get("type") == "none":
         tools = None
     kwargs = {}
@@ -646,6 +663,7 @@ class Event:
     text: str = ""
     call: ToolCall | None = None
     complete: bool = True          # false when the model never closed the call's syntax
+    logprobs: list | None = None   # a text event's tokens' OpenAI logprobs entries (a request that asked: Service.run)
 
 
 THINK_END = "</think>"
@@ -719,8 +737,11 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
-        pname = rest[:rest.index(">")]
-        rest = rest[rest.index(">") + 1:]
+        close = rest.find(">")
+        if close < 0 or "<" in rest[:close]:     # an unclosed <parameter= tag: malformed, as the other cases (#706)
+            raise MalformedToolCall(body)
+        pname = rest[:close]
+        rest = rest[close + 1:]
         end = rest.find("</parameter>")
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len("</parameter>"):] if end >= 0 else ""
@@ -863,6 +884,7 @@ class DsmlRewriter:
 
 MINIMAX_NS = "]<]minimax[>["
 MM_THINK, MM_THINK_END = "<mm:think>", "</mm:think>"
+THINK_AGAIN = "\x00think\x00"   # MinimaxRewriter -> OutputParser: a reasoning block opens (never in model text)
 
 
 def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset()) -> bool:
@@ -892,8 +914,9 @@ def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset(
 
 class MinimaxRewriter:
     """MiniMax-M3.1's output rewritten, as it streams, into what OutputParser reads (DeepSeek's path: GLM's tool-call
-    form with JSON values).  `<mm:think>` opens reasoning (the parser is already in it) and goes; `</mm:think>` is
-    </think>.  Tool calls - `NS<tool_call>` around `NS<invoke name="N">` blocks of `NS<K>V NS</K>` (NS =
+    form with JSON values).  `<mm:think>` opens reasoning: THINK_AGAIN for the parser, which drops it while it is
+    in the reasoning already and goes back into it after an answer part (MiniMax thinks again between tool calls and
+    text: that is reasoning, not answer text); `</mm:think>` is </think>.  Tool calls - `NS<tool_call>` around `NS<invoke name="N">` blocks of `NS<K>V NS</K>` (NS =
     ]<]minimax[>[), a value that holds `NS<k>` elements being an object (or, all `item`, an array) - become
     `<tool_call>N<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>` with V JSON: a string parameter (the
     tool's schema admits a string: may_be_string, a nullable string or a union with one included) JSON-quoted piece
@@ -941,7 +964,7 @@ class MinimaxRewriter:
                 end = self.buf.startswith(MM_THINK_END)
                 tag = MM_THINK_END if end else MM_THINK
                 self.buf = self.buf[len(tag):]
-                out.append(self._plain(tag) if self.key is not None else ("</think>" if end else ""))
+                out.append(self._plain(tag) if self.key is not None else ("</think>" if end else THINK_AGAIN))
                 continue
             rest = self.buf[len(MINIMAX_NS):]
             if not rest:
@@ -1067,12 +1090,20 @@ class OutputParser:
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False):
+                 dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
+                 token_only_end: bool = False):
         self.state = "reasoning" if thinking else "content"
+        # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
+        # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
+        # the server's own code, would have its reasoning cut there and spill into the answer).  The server closes it
+        # through close_reasoning(), at the token.  A template that spells the end as text (GLM's, Qwen's) keeps the
+        # text search.
+        self.token_only_end = token_only_end
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
         self.buf = ""
+        self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
         self.schemas = {} if dsml or minimax else {t.get("name"): t for t in tools or []}
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -1084,6 +1115,7 @@ class OutputParser:
         # the answer text that has gone out, followed to tell a call from a quoted one (Strata #1058): the open code
         # fence, the current line, and the backticks of the current paragraph
         self.fence, self.line, self.ticks = "", "", 0
+        self.malformed: list[str] = []   # the bodies of calls that did not parse (#613), for the server's log
         self._reset_scan()
 
     def _track(self, text: str) -> str:
@@ -1109,6 +1141,22 @@ class OutputParser:
     def _in_code(self) -> bool:
         """The answer so far leaves the next character inside a code fence or inline code."""
         return bool(self.fence) or (self.ticks + self.line.count("`")) % 2 == 1
+
+    def in_code_after(self, text: str) -> bool:
+        """Would `text` - the text held back from the stop-marker scan, which has not been fed yet - leave the next
+        character inside code?  The scan runs before feed(), so _in_code() alone is the state before this piece.  Tracks
+        it on a copy of the state and restores (the answer's own tracking sees the text only in feed)."""
+        snap = (self.fence, self.line, self.ticks)
+        try:
+            self._track(text)
+            return self._in_code()
+        finally:
+            self.fence, self.line, self.ticks = snap
+
+    @property
+    def call_opened(self) -> bool:
+        """A tool call is being read (its body): inside one, even quoted markers are the call's text."""
+        return self.state == "call"
 
     def _reset_scan(self):
         self.sp = 0                  # how much of self.buf (the call body) the scanner has consumed
@@ -1290,6 +1338,17 @@ class OutputParser:
                     best = max(best, n)
         return best
 
+    def close_reasoning(self) -> list[Event]:
+        """The model's end-of-thinking token arrived: the reasoning ends there (token_only_end parsers; a text template
+        closes its own through the text).  Returns the events this close makes, if any."""
+        if self.state != "reasoning" or self.finished:
+            return []
+        out = [Event("reasoning", self.buf)] if self.buf else []
+        self.buf = ""
+        self.state, self.lead = "content", True
+        self.fence, self.line, self.ticks = "", "", 0
+        return out
+
     def feed(self, delta: str) -> list[Event]:
         if self.finished:
             return []
@@ -1303,7 +1362,14 @@ class OutputParser:
         self.buf += delta
         out: list[Event] = []
         while True:
+            if self.state != "content" and THINK_AGAIN in self.buf:
+                self.buf = self.buf.replace(THINK_AGAIN, "")    # (already reasoning; in a call: not an opening)
             if self.state == "reasoning":
+                if self.token_only_end:
+                    if self.buf:
+                        out.append(Event("reasoning", self.buf))
+                        self.buf = ""
+                    return out
                 i = self.buf.find(THINK_END)
                 if i < 0:
                     keep = self._hold(self.buf, (THINK_END,))
@@ -1323,6 +1389,14 @@ class OutputParser:
                         self.buf = ""
                         return out
                     self.buf, self.lead = stripped, False
+                m = self.buf.find(THINK_AGAIN)
+                if m >= 0 and CALL_START not in self.buf[:m]:
+                    # MiniMax thinks again after an answer part: what follows is reasoning until its next </think>
+                    text = self.buf[:m].rstrip("\n")
+                    if text:
+                        out.append(Event("content", self._track(text)))
+                    self.buf, self.state = self.buf[m + len(THINK_AGAIN):], "reasoning"
+                    continue
                 i = self.buf.find(CALL_START)
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
@@ -1355,8 +1429,14 @@ class OutputParser:
                     out.append(Event("content", self._track(self.buf[:i].rstrip("\n"))))
                 self.buf = self.buf[i + len(CALL_START):]
                 self.state = "call"
+                self._call_resume = 0
             else:
-                i = self.buf.find(CALL_END)
+                # the body accumulates in buf until the call closes, so searching from 0 every
+                # delta is O(body) per token.  In call state buf only grows, and a failed search over
+                # L chars rules out every start position up to L - len(CALL_END): resume there.
+                i = self.buf.find(CALL_END, self._call_resume)
+                if i < 0:
+                    self._call_resume = max(0, len(self.buf) - len(CALL_END) + 1)
                 complete = True
                 if self.stream_tools:
                     if i >= 0:
@@ -1376,7 +1456,24 @@ class OutputParser:
                     return out
                 body = self.buf[:i]
                 self.buf = self.buf[i + len(CALL_END):]
-                call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                try:
+                    call = parse_tool_call(body, self.schemas.get(call_name(body)))
+                except MalformedToolCall as e:
+                    # a call that does not parse never fails the whole answer (#613: 24K tokens lost to one): one
+                    # already announced goes out as written so far, marked incomplete (as one the output ended
+                    # inside); one that never got that far is the answer's text, as the model wrote it.  `malformed`
+                    # keeps the body for the server's log
+                    self.malformed.append(e.body)
+                    if self.scall is not None:
+                        rest, self.buf = self.buf, body          # (_close_scan reads the body's unscanned rest)
+                        out += self._close_scan()
+                        self.buf = rest
+                        out.append(Event("tool_call", call=self.scall, complete=False))
+                    else:
+                        out.append(Event("content", self._track(CALL_START + body + CALL_END)))
+                    self._reset_scan()
+                    self.state, self.lead = "content", True
+                    continue
                 if self.dsml is not None and "::" in call.name:
                     call.namespace = call.name.split("::", 1)[0]
                 if self.scall is not None:

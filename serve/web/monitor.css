@@ -18,6 +18,8 @@
 .pill--warn .status__dot { background: var(--st-warn); }
 .pill--danger { background: var(--st-danger-tint); color: var(--st-danger-text); }
 .pill--danger .status__dot { background: var(--st-danger); }
+.pill--ok { background: var(--st-ok-tint); color: var(--st-ok-text); }
+.pill--ok .status__dot { background: var(--st-ok); }
 .mon__wait { color: var(--st-ink-muted); }
 .banners { display: flex; flex-direction: column; gap: 8px; }
 .mon__h2 { margin: 8px 0 -4px; font-size: var(--st-fs-base); font-weight: 600; }
@@ -44,6 +46,8 @@
 .speed__big { font-size: var(--st-fs-hero); font-weight: 600; letter-spacing: -.03em; line-height: 1.05; }
 .speed__mid { font-size: 30px; font-weight: 600; letter-spacing: -.02em; line-height: 1.15; }
 .speed__mid small { font-size: var(--st-fs-md); }
+.speed__row { display: flex; align-items: baseline; gap: 18px; flex-wrap: wrap; }
+.speed__peak { font-size: var(--st-fs-sm); color: var(--st-ink-muted); white-space: nowrap; }
 .spark-wrap { position: relative; height: 72px; }
 .spark-wrap__empty { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
 .spark-wrap.is-empty .spark-wrap__empty { display: flex; }
@@ -57,6 +61,8 @@
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr)); gap: 12px; padding-top: 14px; border-top: 1px solid var(--st-line); }
 .stat { display: flex; flex-direction: column; gap: 2px; }
 .stat__label { font-size: var(--st-fs-sm); color: var(--st-ink-muted); }
+.stat__value--text { white-space: normal; overflow-wrap: anywhere; }
+.stat__note { font-size: var(--st-fs-sm); color: var(--st-ink-muted); font-variant-numeric: tabular-nums; }
 .stat__value { font-size: var(--st-fs-stat); font-weight: 600; letter-spacing: -.01em; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .stat__value small { margin-left: 4px; font-size: var(--st-fs-sm); }
 
@@ -109,7 +115,7 @@
    blindnesses, on both themes); the expert pool keeps the experts' VRAM colour, the CUDA context a neutral grey, free the
    bare track */
 .gpumap { --gm-weights: #3987e5; --gm-kv: #199e70; --gm-act: #c98500; --gm-prompt: #1aa3be; --gm-tp: #5566d0; --gm-drafter: #d55181;
-          --gm-pool: var(--st-accent); --gm-vision: #008300; --gm-other: #d95926; --gm-used: var(--st-accent);
+          --gm-pool: var(--st-accent); --gm-helper: #a273d1; --gm-vision: #008300; --gm-other: #d95926; --gm-used: var(--st-accent);
           --gm-rest: color-mix(in srgb, var(--st-ink-muted) 60%, var(--st-surface-3)); }
 [data-theme="light"] .gpumap { --gm-weights: #2a78d6; --gm-kv: #1baf7a; --gm-act: #eda100; --gm-prompt: #0b8fa8; --gm-tp: #3c4bb4;
                                --gm-drafter: #e87ba4; --gm-other: #eb6834; }
@@ -138,6 +144,7 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
 .gpurows[data-focus="weights"] .gpubar__seg[data-k="weights"], .gpurows[data-focus="kv"] .gpubar__seg[data-k="kv"],
 .gpurows[data-focus="act"] .gpubar__seg[data-k="act"], .gpurows[data-focus="drafter"] .gpubar__seg[data-k="drafter"],
 .gpurows[data-focus="prompt"] .gpubar__seg[data-k="prompt"], .gpurows[data-focus="tp"] .gpubar__seg[data-k="tp"],
+.gpurows[data-focus="helper"] .gpubar__seg[data-k="helper"],
 .gpurows[data-focus="pool"] .gpubar__seg[data-k="pool"], .gpurows[data-focus="vision"] .gpubar__seg[data-k="vision"],
 .gpurows[data-focus="rest"] .gpubar__seg[data-k="rest"], .gpurows[data-focus="other"] .gpubar__seg[data-k="other"],
 .gpurows[data-focus="used"] .gpubar__seg[data-k="used"] { opacity: 1; }
@@ -176,6 +183,14 @@ button.gpurow__line:hover, .gpurow.is-open button.gpurow__line { background: var
   .mon__page { padding: calc(78px + max(10px, env(safe-area-inset-top))) 16px 40px; gap: 16px; }
   .card { padding: 16px; }
   .speed__big { font-size: 40px; }
+  .speeds { row-gap: 14px; flex-wrap: nowrap; justify-content: space-between; gap: 16px; }
+  /* Decode and Prefill side by side; the peak a small line under Decode */
+  .speed__row { flex-direction: column; align-items: flex-start; gap: 2px; }
+  .speed__mid { font-size: 26px; }
+  /* the three one-line figures side by side, the taller Speculation on its own row: no blank under a short one */
+  .stats { grid-template-columns: repeat(3, auto); justify-content: space-between; column-gap: 8px; }
+  .stats .stat__label { white-space: nowrap; }
+  .stat--spec { grid-column: 1 / -1; }
   .gpurow__line { grid-template-columns: minmax(0, 1fr) auto; }
   .gpurow__track { grid-column: 1 / -1; grid-row: 2; }
 }

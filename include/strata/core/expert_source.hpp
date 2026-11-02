@@ -66,6 +66,15 @@ const uint8_t* cache_complement_blob_or_fallback(
     size_t index, const std::vector<uint64_t>& offsets, const uint8_t* complement_host,
     const uint8_t* mapped_fallback);
 
+/// The drive probe's choice: of the reads-at-once counts tried (ascending) and the MB/s each reached, the fewest within
+/// `tol` (0.03: 3%) of the fastest - a drive that gains nothing from more reads in flight keeps few threads.  0: none
+/// measured.
+int pick_reads_at_once(const std::vector<int>& counts, const std::vector<double>& mbps, double tol = 0.03);
+
+/// A drive's line in the per-drive read cache ("<key> reads=<n> ..."): the count cached for `key` in `text` (the last
+/// line for it wins), 0 when there is none.
+int cached_reads_at_once(const std::string& text, const std::string& key);
+
 }  // namespace detail
 
 
@@ -464,7 +473,7 @@ private:
 
 /// The bytes of experts this PC's RAM can take now: the available RAM less the headroom kept for the OS and the page
 /// cache (12% of the RAM, at least 6 GiB).  `total_out`/`avail_out`/`headroom_out` report the three numbers.
-uint64_t expert_ram_room(uint64_t* avail_out = nullptr, uint64_t* headroom_out = nullptr);
+uint64_t expert_ram_room(uint64_t* avail_out = nullptr, uint64_t* headroom_out = nullptr, bool unbuffered = false);
 
 //
 // For a PC whose RAM cannot hold every expert (CYBER-FROST-3.8: 78 GB of Q5_K / IQ4_NL experts; a 64 GB PC) the
@@ -513,6 +522,7 @@ public:
     int64_t resident_blobs() const { return resident_blobs_; }
     uint64_t resident_bytes() const { return resident_bytes_; }
     uint64_t pinned_bytes() const { return pinned_bytes_; }
+    uint64_t all_bytes() const { return all_bytes_; }   // every routed expert in the file (the Monitor's SSD-only share)
     const std::string& note() const { return note_; }
     double load_seconds() const { return load_seconds_; }
 
@@ -526,6 +536,7 @@ private:
         void* mapping = nullptr;
 #else
         int fd = -1;
+        int dfd = -1;   ///< the same file opened O_DIRECT (Linux; -1: none) - the misses are read through it
 #endif
     };
     bool valid(int64_t layer, int64_t expert) const {
@@ -534,6 +545,11 @@ private:
     /// The three slices of an expert: source pointers and sizes (gate, up, down).
     void parts(int64_t layer, int64_t expert, const uint8_t* src[3], uint64_t bytes[3], uint64_t file_off[3]) const;
     void assemble(int64_t layer, int64_t expert, uint8_t* dst) const;
+    /// One slice (0 gate, 1 up, 2 down) of an expert into its place in `dst`: an unbuffered read when the file opened
+    /// for it (a miss then does not go through the page cache, and the SSD sees one read per slice), else the mapping.
+    void assemble_part(int64_t layer, int64_t expert, int part, uint8_t* dst) const;
+    bool read_part_direct(int64_t layer, int64_t expert, int part, uint8_t* dst) const;
+    bool direct_ = false;                  ///< every map has its O_DIRECT descriptor and stagers exist
     std::vector<Map> maps_;
     std::vector<int> map_of_;              ///< per layer: which map holds its experts
     int64_t n_layers_ = 0, n_expert_ = 0;
@@ -547,7 +563,7 @@ private:
     uint64_t registered_bytes_ = 0;
     bool sliced_ = false;
     int64_t resident_blobs_ = 0;
-    uint64_t resident_bytes_ = 0, pinned_bytes_ = 0;
+    uint64_t resident_bytes_ = 0, pinned_bytes_ = 0, all_bytes_ = 0;
     // the staging ring
     std::vector<uint8_t> ring_;
     uint64_t ring_stride_ = 0;

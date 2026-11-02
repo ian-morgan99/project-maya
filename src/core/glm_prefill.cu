@@ -1220,9 +1220,13 @@ bool Glm5Model::prefill_setup(std::string& err) {
             if (T < kPreMinT || gstride == 0) return ring_max;   // (a chunk this short carves no prestage buffer)
             return std::min<int64_t>(ring_max, (int64_t) ((lendable - nr - 256) / gstride));
         };
-        // Strata's biggest_chunk: every test rises with T, so the largest chunk that passes is a bisection on the grid
+        // Strata's biggest_chunk: every test rises with T, so the largest chunk that passes is a bisection on the grid.
+        // A test for a prestage buffer (floor > 0) is searched from kPreMinT up: a shorter chunk carves none, so it
+        // "passed" any floor, the test was not monotonic there, and a card whose pool could not hold the whole ring
+        // beside a 1024-token chunk got 768-token chunks with no ring at all instead of the largest chunk with a part
+        // of it (#673: a 20 GB card, Maya-S24 at 256K: 768 where 10240 fit, half the prompt speed)
         const auto biggest = [&](int64_t floor) -> int64_t {
-            int64_t lo = 1, hi = ceiling / 256, best = 0;
+            int64_t lo = floor > 0 && gstride > 0 ? kPreMinT / 256 : 1, hi = ceiling / 256, best = 0;
             while (lo <= hi) {
                 const int64_t mid = lo + (hi - lo) / 2;
                 if (room(mid * 256) >= floor) {
@@ -1475,7 +1479,7 @@ static std::pair<size_t, size_t> chunk_bytes(const Glm5Geometry& g, size_t T, bo
     a.take<float>(T * 16);
     a.take<float>(T);
     a.take<float>(T * 24);
-    a.take<int>(T * (size_t) g.n_exp_used);      // iota
+    a.take<int>(T * (size_t) g.n_exp_used + mmq::IDS_PAD);   // iota (MMQ reads whole tiles of ids past its last row)
     a.take<uint8_t>(kv_stage);
     size_t uni = 0;
     const size_t ts = std::min<size_t>(T, mixer_sub(T, g, has_kda, has_dsa, has_dense, has_moe, max_pools, sub_env));
@@ -1559,7 +1563,7 @@ bool Glm5Model::prefill_carve(int Tn, int64_t end) {
     S->comb = a.take<float>(T * 16);
     S->ss = a.take<float>(T);
     S->mix = a.take<float>(T * 24);
-    S->iota = a.take<int>(T * (size_t) g.n_exp_used);
+    S->iota = a.take<int>(T * (size_t) g.n_exp_used + mmq::IDS_PAD);   // (see mmq::IDS_PAD)
     S->kv_stage = stage > 0 ? a.take<uint8_t>(stage) : nullptr;
     S->uni = S->arena + a.off;
     blas_ck(cublasSetWorkspace(S->blas, S->ws, S->ws_bytes), "set workspace");
@@ -1623,7 +1627,7 @@ bool Glm5Model::prefill_lend(std::string& err) {
         }
     }
     // the borrowed memory holds expert bytes: what the prompt path reads before writing is set up again
-    mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used, F->cs);
+    mmq::iota(S->iota, (int64_t) S->T_bound * g_.n_exp_used + mmq::IDS_PAD, F->cs);
     for (int b = 0; b < PrefillState::NG; ++b) cudaEventRecord(S->ev_free[b], F->cs);
     if (S->ev_pfree) cudaEventRecord(S->ev_pfree, F->cs);
     S->pre_layer = -1;
@@ -2360,8 +2364,16 @@ bool Glm5Model::prefill_half(int64_t p0, int T, std::string& err, const int32_t*
         const char* v = getenv("STRATA_GLM_PREFILL_CPU");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    // the start-up timing's gate: the CPU lane takes prompt experts only when PCIe moves one more than this many times
+    // slower than the lane computes it (STRATA_GLM_PREFILL_CPU_GATE, default 2; the per-expert plan below still
+    // balances both lanes, so a lower gate only lets it try: one RTX 5070 on PCIe 4.0 x16 beside an EPYC 7302,
+    // 0.357 vs 0.252 ms, Maya-S24 2K / 8K-token prompts 309 / 323 -> 404 / 428 tok/s at 0)
+    static const double pf_cpu_gate = [] {
+        const char* v = getenv("STRATA_GLM_PREFILL_CPU_GATE");
+        return v != nullptr ? std::atof(v) : 2.0;
+    }();
     const auto cpu_lane = [&](int il) {
-        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > 2.0 * F->cpu_c_ms &&
+        return pf_cpu && F->cpu_pool && F->cpu_c_ms > 0.0 && F->cpu_p_ms > pf_cpu_gate * F->cpu_c_ms &&
                (size_t) il < F->cpu_fmt.size() && F->cpu_fmt[(size_t) il].n_ff > 0;
     };
     // the CPU lane's stream (x down, the rows' tokens down) and its pinned buffers
@@ -4560,7 +4572,7 @@ bool Glm5Model::prefill_run(const std::vector<int32_t>& tokens, std::string& err
             PrefillState* S = m->pf_;
             cudaSetDevice(m->dev_);
             if (m == owner && S->cb_used) {
-                mmq::iota(S->iota, (int64_t) S->T_bound * g.n_exp_used, m->fast_->cs);
+                mmq::iota(S->iota, (int64_t) S->T_bound * g.n_exp_used + mmq::IDS_PAD, m->fast_->cs);
                 S->cb_used = false;
             }
             cudaEventRecord(S->ev_turn, m->fast_->cs);
