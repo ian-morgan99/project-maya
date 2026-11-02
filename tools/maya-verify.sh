@@ -12,6 +12,23 @@
 #         MAYA_WAIT=1200 maya-verify.sh (a cold GLM load takes minutes: longer wait)
 set -u
 
+# the Maya folder: this script's own directory when it lives in the repo's tools/, MAYA_DIR for
+# the copy installed in ~/.local/bin, and this PC's setup as a last resort.  Its venv's python
+# reads the JSON reply, and has to be found from wherever this is run.
+HERE=$(cd "$(dirname "$0")" && pwd)
+if [ -f "$HERE/../maya.py" ]; then
+  ROOT=$(cd "$HERE/.." && pwd)
+elif [ -n "${MAYA_DIR:-}" ] && [ -f "$MAYA_DIR/maya.py" ]; then
+  ROOT="$MAYA_DIR"
+elif [ -f "/home/ian/Documents/VSCodeProjects/Maya/project-maya/maya.py" ]; then
+  ROOT="/home/ian/Documents/VSCodeProjects/Maya/project-maya"
+else
+  echo "Project Maya not found: set MAYA_DIR to its folder."
+  exit 1
+fi
+PY="$ROOT/.venv/bin/python"
+[ -x "$PY" ] || PY=$(command -v python3)
+
 PROMPT="${2:-Reply with exactly two words: hello from Maya}"
 WAIT="${MAYA_WAIT:-900}"          # seconds to wait for the model to load
 
@@ -64,7 +81,7 @@ for _ in $(seq 1 "$WAIT"); do
   [ -n "$MODEL" ] && break
   sleep 1
 done
-[ -n "$MODEL" ] || { echo "timed out: the model never came up.  Engine log:"; ls -t /home/ian/Documents/VSCodeProjects/Maya/project-maya/*.log 2>/dev/null | head -1 | xargs -r tail -20; exit 1; }
+[ -n "$MODEL" ] || { echo "timed out: the model never came up.  Engine log:"; ls -t "$ROOT"/*.log 2>/dev/null | head -1 | xargs -r tail -20; exit 1; }
 echo "   loaded: $MODEL"
 
 echo "== one chat request =="
@@ -72,11 +89,11 @@ T0=$(date +%s.%N)
 RESP=$(curl -fsS -m 900 "http://127.0.0.1:$PORT/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -d "{\"model\": \"$MODEL\", \"max_tokens\": 512, \"temperature\": 0.2,
-       \"messages\": [{\"role\": \"user\", \"content\": $(printf '%s' "$PROMPT" | .venv/bin/python -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '"hello"')}]}") \
+       \"messages\": [{\"role\": \"user\", \"content\": $(printf '%s' "$PROMPT" | "$PY" -c 'import json,sys; print(json.dumps(sys.stdin.read()))' 2>/dev/null || echo '"hello"')}]}") \
   || { echo "the request failed"; exit 1; }
 T1=$(date +%s.%N)
 
-.venv/bin/python - "$RESP" "$T0" "$T1" <<'EOF'
+"$PY" - "$RESP" "$T0" "$T1" <<'EOF'
 import json, sys
 r = json.loads(sys.argv[1])
 t0, t1 = float(sys.argv[2]), float(sys.argv[3])
