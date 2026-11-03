@@ -1,0 +1,45 @@
+/* Project Maya UI - the Strata model sweep page: every model folder in LM Studio's model folder,
+   classified as Strata-runnable, Maya-runnable, or unsupported. */
+
+.sm__page { max-width: 960px; gap: 16px; }
+
+.sm__head { display: flex; align-items: baseline; gap: 10px; padding: 16px 18px 8px; border-bottom: 1px solid var(--st-line); }
+.sm__title { font-size: var(--st-fs-lg); font-weight: 600; }
+.sm__subtitle { font-size: var(--st-fs-sm); color: var(--st-ink-muted); margin-left: auto; }
+
+.sm__err { padding: 12px 18px; color: var(--st-danger); background: color-mix(in srgb, var(--st-danger) 12%, transparent); border: 1px solid color-mix(in srgb, var(--st-danger) 35%, var(--st-line)); border-radius: var(--st-r-md); }
+
+.sm__group { margin: 16px 18px 0; }
+.sm__group h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; font-size: var(--st-fs-md); font-weight: 600; }
+.sm__badge { display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: var(--st-r-xs); font-size: var(--st-fs-xs); font-weight: 600; white-space: nowrap; }
+.sm__badge--strata { background: color-mix(in srgb, var(--st-accent) 12%, var(--st-surface-2)); color: var(--st-accent); border: 1px solid color-mix(in srgb, var(--st-accent) 35%, var(--st-line)); }
+.sm__badge--maya { background: color-mix(in srgb, var(--st-info) 12%, var(--st-surface-2)); color: var(--st-info); border: 1px solid color-mix(in srgb, var(--st-info) 35%, var(--st-line)); }
+.sm__badge--muted { background: var(--st-surface-2); color: var(--st-ink-muted); border: 1px solid var(--st-line); }
+.sm__count { font-size: var(--st-fs-sm); color: var(--st-ink-muted); margin-left: auto; }
+
+.sm__list { display: flex; flex-direction: column; gap: 8px; }
+
+.sm__card { display: flex; flex-direction: column; gap: 8px; padding: 14px 16px; border: 1px solid var(--st-line); border-radius: var(--st-r-md); background: var(--st-surface); }
+.sm__card--strata { border-color: color-mix(in srgb, var(--st-accent) 35%, var(--st-line)); }
+.sm__card--maya { border-color: color-mix(in srgb, var(--st-info) 35%, var(--st-line)); }
+.sm__card--muted { border-color: var(--st-line); }
+
+.sm__card__head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.sm__card__name { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sm__card__name b { font-size: var(--st-fs-md); font-weight: 600; color: var(--st-ink); overflow-wrap: anywhere; }
+.sm__card__size { font-size: var(--st-fs-sm); color: var(--st-ink-muted); white-space: nowrap; }
+
+.sm__card__notes { font-size: var(--st-fs-sm); color: var(--st-ink-muted); margin: 0; }
+
+.sm__card__facts { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 6px; }
+.sm__fact__label { font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.sm__fact__val { font-size: var(--st-fs-sm); font-weight: 600; color: var(--st-ink-soft); }
+.sm__fact__val.yes { color: var(--st-ok); }
+.sm__fact__val.no { color: var(--st-ink-muted); }
+
+.sm__card__hint { font-size: var(--st-fs-xs); color: var(--st-ink-muted); margin: 4px 0 0; }
+
+.sm__files { margin-top: 8px; border-top: 1px solid var(--st-line); padding-top: 8px; }
+.sm__files summary { font-size: var(--st-fs-xs); color: var(--st-ink-muted); cursor: pointer; }
+.sm__file-list { margin: 4px 0 0 16px; font-size: var(--st-fs-xs); color: var(--st-ink-muted); }
+.sm__file-list li { margin: 2px 0; }

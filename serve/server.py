@@ -54,6 +54,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.bat) as well as a module
 from serve import ds4_vision, gpu_map, loop_guard, mm3_vision, model_api, model_pull, models, savings  # noqa: E402
+try:
+    from tools.model_sweep import sweep as model_sweep  # noqa: E402
+except Exception:  # noqa: BLE001 - the sweep module is optional
+    model_sweep = None
 
 ENGINE_VISION = (ds4_vision.Vision, mm3_vision.Vision)   # the engines that run their vision tower themselves
 from serve.frontend import (CALL_END, CALL_START, MINIMAX_NS, ChatTemplate, Event, OutputParser,  # noqa: E402
@@ -5429,6 +5433,14 @@ def make_handler(svc: Service):
                 # the Models page: the configs the setup wrote, the running one, each one's engine settings
                 if self._authorized():
                     self._json(200, svc.models_info())
+            elif path == "/api/strata-models":
+                # the Strata model sweep: every folder in LM Studio's model folder, classified as Strata-runnable,
+                # Maya-runnable, or unsupported (read-only: nothing is moved or deleted)
+                if self._authorized():
+                    if model_sweep is None:
+                        self._json(500, {"error": "the model sweep module is not available"})
+                    else:
+                        self._json(200, model_sweep())
             elif path == "/api/savings":
                 # the sidebar's Saved: what the model's own API would have charged for the same tokens, per model
                 if self._authorized():

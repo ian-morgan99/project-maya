@@ -307,6 +307,8 @@ export function Sidebar({drawer, open}) {
       <${Icon} name="search"/><span>Search chats</span><${Kbd} k=${`${MOD} K`}/></button>
     <button type="button" class=${`nav-item${S.view === "models" ? " is-current" : ""}`} aria-current=${S.view === "models" ? "page" : undefined}
       onClick=${() => showView("models")}><${Icon} name="boxes"/><span>Models</span></button>
+    <button type="button" class=${`nav-item${S.view === "strata" ? " is-current" : ""}`} aria-current=${S.view === "strata" ? "page" : undefined}
+      onClick=${() => showView("strata")}><${Icon} name="cpu"/><span>Strata models</span></button>
     <button type="button" class=${`nav-item${S.view === "monitor" ? " is-current" : ""}`} aria-current=${S.view === "monitor" ? "page" : undefined}
       onClick=${() => showView("monitor")}><${Icon} name="activity"/><span>Monitor</span></button>
     <button type="button" class="nav-item" onClick=${() => openSettings(newer ? "about" : "general")}>

@@ -14,6 +14,7 @@ import {loadTurbo} from "./turbo.js";
 import {SettingsDialog} from "./settings.js";
 import {MonitorPage} from "./monitor.js";
 import {ModelsPage} from "./models.js";
+import {StrataModelsPage} from "./strata-models.js";
 
 applyTheme();
 applyScheme();
@@ -26,7 +27,7 @@ function App() {
     const want = S.view === "monitor" ? "#monitor" : S.view === "models" ? "#models" : S.settings ? "#settings" : "";
     if (location.hash !== want) history.replaceState(null, "", want || location.pathname + location.search);
   });
-  const page = S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : html`<${ChatPage}/>`;
+  const page = S.view === "monitor" ? html`<${MonitorPage}/>` : S.view === "models" ? html`<${ModelsPage}/>` : S.view === "strata" ? html`<${StrataModelsPage}/>` : html`<${ChatPage}/>`;
   return html`<div class=${`shell${S.sideOpen && !phone ? "" : " shell--closed"}`}>
     ${phone ? html`<${PhonePush} page=${page}/>` : S.sideOpen ? html`<${Sidebar}/>` : null}
     ${phone ? null : page}
@@ -99,9 +100,9 @@ addEventListener("resize", () => { if (isPhone() !== wasPhone) { wasPhone = isPh
 // the address: #monitor, #models, #settings, #about
 function route() {
   const h = location.hash.slice(1);
-  if (h === "monitor" || h === "models") showView(h);
-  else if (h === "settings" || h === "about") { S.view = S.view === "monitor" || S.view === "models" ? S.view : "chat"; openSettings(h === "about" ? "about" : "general"); }
-  else if (!h && (S.view === "monitor" || S.view === "models")) showView("chat");
+  if (h === "monitor" || h === "models" || h === "strata") showView(h);
+  else if (h === "settings" || h === "about") { S.view = S.view === "monitor" || S.view === "models" || S.view === "strata" ? S.view : "chat"; openSettings(h === "about" ? "about" : "general"); }
+  else if (!h && (S.view === "monitor" || S.view === "models" || S.view === "strata")) showView("chat");
 }
 addEventListener("hashchange", route);
 
